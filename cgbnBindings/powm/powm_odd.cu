@@ -60,8 +60,7 @@ class powm_params_t {
   static const uint32_t WINDOW_BITS=window_bits;   // window size
 };
 
-template<uint32_t bits>
-static __constant__ cgbn_mem_t<bits> MODULUS;    // modulus is the same for all instances
+static __constant__ cgbn_mem_t<2048> MODULUS;    // modulus is the same for all instances
                                                  // TODO(nan) Is it a good idea to re-upload the modulus each time?
                                                  // It's not that much bandwidth required...
                                                  // how about running the kernel on a smaller and a bigger prime?
@@ -234,7 +233,7 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   cgbn_load(po._env, p, &(instances[instance].power));
   cgbn_load(po._env, m, &(instances[instance].modulus));
   
-  // this can be either fixed_window_powm_odd or sliding_window_powm_odd.  
+  // this can be either fixed_window_powm_odd or sliding_window_powm_odd.
   // when TPI<32, fixed window runs much faster because it is less divergent, so we use it here
   po.fixed_window_powm_odd(r, x, p, m);
   //   OR
@@ -243,20 +242,44 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   cgbn_store(po._env, &(instances[instance].result), r);
 }
 
+// TODO Is there a way to be type safe without an array of structs setup?
 template<class params>
-cgbn_mem_t<params::BITS> run_powm(const cgbn_mem_t<params::BITS> *modulus, 
-  cgbn_mem_t<params::BITS> *x, cgbn_mem_t<params::BITS> *pow, uint32_t instance_count) {
+void* run_powm(const void* modulus, void *x, void *pow, uint32_t instance_count) {
   // TODO Each kernel run should return all errors that occurred during the run in a single string
+  
   cgbn_error_report_t *report;
   int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
+  void *gpuMemPool;
+  void *gpuX, *gpuPow, *gpuResults;
   
   CUDA_CHECK(cudaSetDevice(0));
-  printf("Copying x to the GPU ...\n");
-  CUDA_CHECK(cudaMalloc((void **)&gpuX, sizeof(cgbn_mem_t<params::BITS>)*instance_count));
-  CUDA_CHECK(cudaMemcpy(gpuX, x, sizeof(cgbn_mem_t<params::BITS>)*instance_count, cudaMemcpyHostToDevice));
-  printf("Copying pow to the GPU ...\n");
+  printf("Copying args to the GPU ...\n");
+  // Is this the best way of allocating memory for each kernel launch?
+  // Is there actually a perf difference doing things this way vs the AoS allocation style?
+  CUDA_CHECK(cudaMalloc((void **)&gpuMemPool, 3*sizeof(cgbn_mem_t<params::BITS>)*instance_count));
+  gpuX = gpuMemPool;
+  size_t instanceArgSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
+  // Is there a way to offset into a buffer of a known size without causing
+  // warnings? This definitely feels icky. Maybe I can use an argument to cudaMemcpy
+  // to specify the offset....?
+  // Looks like that (offset) isn't a cudaMemcpy argument, of any variant except MemcpyToSymbol.
+  gpuPow = gpuMemPool + instanceArgSize;
+  gpuResults = gpuMemPool + 2*instanceArgSize;
+  CUDA_CHECK(cudaMemcpy(gpuX, x, instanceArgSize, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(gpuPow, pow, instanceArgSize, cudaMemcpyHostToDevice));
+  // FIXME Don't malloc this again if running the kernel more than once?
+  // Do __constant__ variables need to be allocated? Am I even doing this right?
+  // Maybe mallocing and populating this for the first time should be part of
+  // an initialization function.
+  // Then, it should get re-uploaded at the start of each phase, or maybe it
+  // should be checked that it matches something on the CPU. Ideally, the
+  // modulus should be hard to mess with. That would potentially be a valid
+  // reason for having a separate modulus
   printf("Copying modulus to the GPU ...\n");
+  // Let's just malloc and free it every time for now and see if that works.
+  CUDA_CHECK(cudaMalloc((void **)&MODULUS, sizeof(cgbn_mem_t<params::BITS>)));
+  CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, cudaMemcpyHostToDevice));
   
   // create a cgbn_error_report for CGBN to report back errors
   CUDA_CHECK(cgbn_error_report_alloc(&report)); 
@@ -264,16 +287,16 @@ cgbn_mem_t<params::BITS> run_powm(const cgbn_mem_t<params::BITS> *modulus,
   printf("Running GPU kernel ...\n");
   
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
-  kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInstances, instance_count);
+  kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, modulus, x, pow, instance_count);
 
   // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
   CUDA_CHECK(cudaDeviceSynchronize());
   CGBN_CHECK(report);
-    
+  
   // copy the instances back from gpuMemory
   printf("Copying results back to CPU ...\n");
   // We don't actually need to memcpy anything that's not an output
-  CUDA_CHECK(cudaMemcpy(instances, gpuInstances, sizeof(instance_t)*instance_count, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(results, gpuResults, sizeof(instance_t)*instance_count, cudaMemcpyDeviceToHost));
   
   // printf("Verifying the results ...\n");
 //  powm_odd_t<params>::verify_results(instances, instance_count);
@@ -281,9 +304,10 @@ cgbn_mem_t<params::BITS> run_powm(const cgbn_mem_t<params::BITS> *modulus,
   // clean up
   // TODO Instances will now need to be freed manually from the Go side once
   //  GC-tracked copies are made. We will need a new method that calls free on this memory.
-//  free(instances);
-  CUDA_CHECK(cudaFree(gpuInstances));
+  CUDA_CHECK(cudaFree(gpuMemPool));
+  CUDA_CHECK(cudaFree(MODULUS));
   CUDA_CHECK(cgbn_error_report_free(report));
+  return results;
 }
 
 // All the methods used in cgo should have extern "C" linkage to avoid
@@ -293,14 +317,10 @@ extern "C" {
     // Can the 2048 be templated?
     typedef powm_params_t<8, 2048, 5> params;
     struct powm_2048_return {
-        cgbn_mem_t<2048> *powm_results;
+        void *powm_results;
         char *error;
     };
-    powm_2048_return* powm_2048(void *prime, void *x, void *y, uint32_t instance_count) {
-        cgbn_mem_t<2048> powm_results;
-        powm_results = run_powm<params>(
-            (cgbn_mem_t<2048>)(prime), 
-        (cgbn_mem_t<2048>)(x), (cgbn_mem_t<2048>)(y), instance_count);
+    powm_2048_return* powm_2048(const void *prime, void *x, void *y, uint32_t instance_count) {
         // I don't remember if you can safely cast the result of malloc
         // Like, I remember seeing somewhere that you're not supposed to do it this way
         powm_2048_return *result = (powm_2048_return*)malloc(sizeof(struct powm_2048_return));
@@ -313,7 +333,7 @@ extern "C" {
         // We're just going to have result be null for now
         // That should result in a blank error string on the Go side
         result->error = NULL;
-        result->powm_results = powm_results;
+        result->powm_results = run_powm<params>(prime, x, y, instance_count);
         // TODO put the actual error string in here
         // Probably the actual error returning would work better with strncat?
         // (Is that a safe method to use? C is so mysterious)
