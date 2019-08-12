@@ -60,17 +60,32 @@ class powm_params_t {
   static const uint32_t WINDOW_BITS=window_bits;   // window size
 };
 
-static __constant__ cgbn_mem_t<2048> MODULUS;    // modulus is the same for all instances
+// Is there no way to use the class parameters to populate the length of this array?
+// It's a CUDA limitation that __constant__ variables can't be members of a class...
+// We could go with the old-school macro route.
+static __constant__ cgbn_mem_t<2048> MODULUS;    // modulus is the same for all instances, at least during each kernel launch
                                                  // TODO(nan) Is it a good idea to re-upload the modulus each time?
                                                  // It's not that much bandwidth required...
                                                  // how about running the kernel on a smaller and a bigger prime?
                                                  // what would be the best way to set that up?
                                                  // Do you just need to have two global variables, one for each modulus?
+                                                 // Maybe the additional limitations that constant variables give aren't worth the extra headache.
 
 template<class params>
 class powm_odd_t {
   public:
   static const uint32_t window_bits=params::WINDOW_BITS;  // used a lot, give it an instance variable
+
+  // It might be possible to switch to a SOA structure within the instance_t struct
+  // Currently, I believe removing this struct completely would make things worse
+  // I also need to run benchmarks on an x16 pcie link to make sure we're making the correct pcie bandwidth tradeoff
+  // Results shouldn't belong in the instance struct. They should get allocated and written separately, so as to not
+  // have to download and uploaded more than is necessary. x and pow should only be uploaded, and results should only
+  // be downloaded.
+  typedef struct {
+    cgbn_mem_t<params::BITS> x;
+    cgbn_mem_t<params::BITS> power;
+  } input_t;
   
   typedef cgbn_context_t<params::TPI, params>   context_t;
   typedef cgbn_env_t<context_t, params::BITS>   env_t;
@@ -214,9 +229,9 @@ class powm_odd_t {
 // kernel implementation using cgbn
 // 
 // Unfortunately, the kernel must be separate from the powm_odd_t class
-
+// kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 template<class params>
-__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t<params>::instance_t *instances, uint32_t count) {
+__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t<params>::input_t *inputs, cgbn_mem_t<params::BITS> *outputs, uint32_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -229,9 +244,9 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   
   // the loads and stores can go in the class, but it seems more natural to have them
   // here and to pass in and out bignums
-  cgbn_load(po._env, x, &(instances[instance].x));
-  cgbn_load(po._env, p, &(instances[instance].power));
-  cgbn_load(po._env, m, &(instances[instance].modulus));
+  cgbn_load(po._env, x, &(inputs[instance].x));
+  cgbn_load(po._env, p, &(inputs[instance].power));
+  cgbn_load(po._env, m, &MODULUS);
   
   // this can be either fixed_window_powm_odd or sliding_window_powm_odd.
   // when TPI<32, fixed window runs much faster because it is less divergent, so we use it here
@@ -239,35 +254,36 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   //   OR
   // po.sliding_window_powm_odd(r, x, p, m);
   
-  cgbn_store(po._env, &(instances[instance].result), r);
+  cgbn_store(po._env, &(outputs[instance]), r);
 }
 
 // TODO Is there a way to be type safe without an array of structs setup?
 template<class params>
-void* run_powm(const void* modulus, void *x, void *pow, uint32_t instance_count) {
+void run_powm(const void* modulus, void *inputs, void *results, uint32_t instance_count) {
+  typedef typename powm_odd_t<params>::input_t input_t;
   // TODO Each kernel run should return all errors that occurred during the run in a single string
   
   cgbn_error_report_t *report;
   int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
-  void *gpuMemPool;
-  void *gpuX, *gpuPow, *gpuResults;
+  input_t *gpuInputs;
+  cgbn_mem_t<params::BITS> *gpuResults;
   
   CUDA_CHECK(cudaSetDevice(0));
-  printf("Copying args to the GPU ...\n");
+  printf("Copying inputs to the GPU ...\n");
   // Is this the best way of allocating memory for each kernel launch?
   // Is there actually a perf difference doing things this way vs the AoS allocation style?
-  CUDA_CHECK(cudaMalloc((void **)&gpuMemPool, 3*sizeof(cgbn_mem_t<params::BITS>)*instance_count));
-  gpuX = gpuMemPool;
-  size_t instanceArgSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
+  // Results will be written to the end of this area of memory
+  // I'm pretty sure this is a dumb way of doing it...
+  const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
+  const size_t inputsSize = sizeof(input_t)*instance_count;
+  CUDA_CHECK(cudaMalloc((void **)&gpuInputs, inputsSize));
+  CUDA_CHECK(cudaMalloc((void **)&gpuResults, resultsSize));
   // Is there a way to offset into a buffer of a known size without causing
   // warnings? This definitely feels icky. Maybe I can use an argument to cudaMemcpy
   // to specify the offset....?
   // Looks like that (offset) isn't a cudaMemcpy argument, of any variant except MemcpyToSymbol.
-  gpuPow = gpuMemPool + instanceArgSize;
-  gpuResults = gpuMemPool + 2*instanceArgSize;
-  CUDA_CHECK(cudaMemcpy(gpuX, x, instanceArgSize, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(gpuPow, pow, instanceArgSize, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
   // FIXME Don't malloc this again if running the kernel more than once?
   // Do __constant__ variables need to be allocated? Am I even doing this right?
   // Maybe mallocing and populating this for the first time should be part of
@@ -278,6 +294,9 @@ void* run_powm(const void* modulus, void *x, void *pow, uint32_t instance_count)
   // reason for having a separate modulus
   printf("Copying modulus to the GPU ...\n");
   // Let's just malloc and free it every time for now and see if that works.
+  // If it's the same every time, it shouldn't be a problem.
+  // Although, it might not need to be allocated and freed every time,
+  // and it would surprise me if it actually worked.
   CUDA_CHECK(cudaMalloc((void **)&MODULUS, sizeof(cgbn_mem_t<params::BITS>)));
   CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, cudaMemcpyHostToDevice));
   
@@ -287,27 +306,24 @@ void* run_powm(const void* modulus, void *x, void *pow, uint32_t instance_count)
   printf("Running GPU kernel ...\n");
   
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
-  kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, modulus, x, pow, instance_count);
+  kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 
   // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
   CUDA_CHECK(cudaDeviceSynchronize());
   CGBN_CHECK(report);
   
-  // copy the instances back from gpuMemory
+  // copy the results back from gpuMemory
   printf("Copying results back to CPU ...\n");
   // We don't actually need to memcpy anything that's not an output
-  CUDA_CHECK(cudaMemcpy(results, gpuResults, sizeof(instance_t)*instance_count, cudaMemcpyDeviceToHost));
-  
-  // printf("Verifying the results ...\n");
-//  powm_odd_t<params>::verify_results(instances, instance_count);
+  CUDA_CHECK(cudaMemcpy(results, gpuResults, resultsSize, cudaMemcpyDeviceToHost));
 
   // clean up
   // TODO Instances will now need to be freed manually from the Go side once
   //  GC-tracked copies are made. We will need a new method that calls free on this memory.
-  CUDA_CHECK(cudaFree(gpuMemPool));
-  CUDA_CHECK(cudaFree(MODULUS));
+  CUDA_CHECK(cudaFree(gpuInputs));
+  CUDA_CHECK(cudaFree(gpuResults));
+//   CUDA_CHECK(cudaFree(MODULUS));
   CUDA_CHECK(cgbn_error_report_free(report));
-  return results;
 }
 
 // All the methods used in cgo should have extern "C" linkage to avoid
@@ -320,10 +336,12 @@ extern "C" {
         void *powm_results;
         char *error;
     };
-    powm_2048_return* powm_2048(const void *prime, void *x, void *y, uint32_t instance_count) {
+    powm_2048_return* powm_2048(const void *prime, void *instances, uint32_t instance_count) {
         // I don't remember if you can safely cast the result of malloc
         // Like, I remember seeing somewhere that you're not supposed to do it this way
         powm_2048_return *result = (powm_2048_return*)malloc(sizeof(struct powm_2048_return));
+        // Can i get the size of an individual BN in a better way than this?
+        void *results_mem = malloc(params::BITS/8 * instance_count);
         // Then we need to actually follow all the pointers in the returned struct and free them after all results
         // are copied in Golang...
         // Should I use C++ strings here instead of dealing with this C string?
@@ -333,7 +351,12 @@ extern "C" {
         // We're just going to have result be null for now
         // That should result in a blank error string on the Go side
         result->error = NULL;
-        result->powm_results = run_powm<params>(prime, x, y, instance_count);
+        // You must free the results from the go side after you copy them
+        // I should make a binding that frees everything
+        // There is definitely a better way to do this
+// void run_powm(const void* modulus, void *inputs, void *results, uint32_t instance_count) {
+        run_powm<params>(prime, instances, results_mem, instance_count);
+        result->powm_results = results_mem;
         // TODO put the actual error string in here
         // Probably the actual error returning would work better with strncat?
         // (Is that a safe method to use? C is so mysterious)
