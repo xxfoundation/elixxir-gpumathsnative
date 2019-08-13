@@ -113,6 +113,9 @@ class powm_odd_t {
     cgbn_store(_env, window+0, t);
     
     // convert x into Montgomery space, store into window table
+    // Conclusion: Right now, only one byte is getting copied by cudaMemcpyToSymbol.
+    //  This will of course result in an error, as there aren't enough bits
+    //  available to do a Montgomery reduction.
     np0=cgbn_bn2mont(_env, result, x, modulus);
     cgbn_store(_env, window+1, result);
     cgbn_set(_env, t, result);
@@ -259,7 +262,7 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
 
 // TODO Is there a way to be type safe without an array of structs setup?
 template<class params>
-void run_powm(const void* modulus, void *inputs, void *results, uint32_t instance_count) {
+void run_powm(const void* modulus, const void *inputs, void *results, const uint32_t instance_count) {
   typedef typename powm_odd_t<params>::input_t input_t;
   // TODO Each kernel run should return all errors that occurred during the run in a single string
   
@@ -275,30 +278,18 @@ void run_powm(const void* modulus, void *inputs, void *results, uint32_t instanc
   // Is there actually a perf difference doing things this way vs the AoS allocation style?
   // Results will be written to the end of this area of memory
   // I'm pretty sure this is a dumb way of doing it...
+  size_t modulusSize = sizeof(cgbn_mem_t<params::BITS>);
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
   const size_t inputsSize = sizeof(input_t)*instance_count;
   CUDA_CHECK(cudaMalloc((void **)&gpuInputs, inputsSize));
   CUDA_CHECK(cudaMalloc((void **)&gpuResults, resultsSize));
-  // Is there a way to offset into a buffer of a known size without causing
-  // warnings? This definitely feels icky. Maybe I can use an argument to cudaMemcpy
-  // to specify the offset....?
-  // Looks like that (offset) isn't a cudaMemcpy argument, of any variant except MemcpyToSymbol.
+
   CUDA_CHECK(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
-  // FIXME Don't malloc this again if running the kernel more than once?
-  // Do __constant__ variables need to be allocated? Am I even doing this right?
-  // Maybe mallocing and populating this for the first time should be part of
-  // an initialization function.
-  // Then, it should get re-uploaded at the start of each phase, or maybe it
-  // should be checked that it matches something on the CPU. Ideally, the
-  // modulus should be hard to mess with. That would potentially be a valid
-  // reason for having a separate modulus
+
+  // Currently, we're copying to the modulus before each kernel launch
+  // I'm not sure how to handle benchmarking with two groups...
   printf("Copying modulus to the GPU ...\n");
-  // Let's just malloc and free it every time for now and see if that works.
-  // If it's the same every time, it shouldn't be a problem.
-  // Although, it might not need to be allocated and freed every time,
-  // and it would surprise me if it actually worked.
-  CUDA_CHECK(cudaMalloc((void **)&MODULUS, sizeof(cgbn_mem_t<params::BITS>)));
-  CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
   
   // create a cgbn_error_report for CGBN to report back errors
   CUDA_CHECK(cgbn_error_report_alloc(&report)); 
@@ -322,7 +313,6 @@ void run_powm(const void* modulus, void *inputs, void *results, uint32_t instanc
   //  GC-tracked copies are made. We will need a new method that calls free on this memory.
   CUDA_CHECK(cudaFree(gpuInputs));
   CUDA_CHECK(cudaFree(gpuResults));
-//   CUDA_CHECK(cudaFree(MODULUS));
   CUDA_CHECK(cgbn_error_report_free(report));
 }
 
@@ -336,7 +326,8 @@ extern "C" {
         void *powm_results;
         char *error;
     };
-    powm_2048_return* powm_2048(const void *prime, void *instances, uint32_t instance_count) {
+    powm_2048_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
+        printf("Error is after CUDA so call\n");
         // I don't remember if you can safely cast the result of malloc
         // Like, I remember seeing somewhere that you're not supposed to do it this way
         powm_2048_return *result = (powm_2048_return*)malloc(sizeof(struct powm_2048_return));
@@ -354,7 +345,6 @@ extern "C" {
         // You must free the results from the go side after you copy them
         // I should make a binding that frees everything
         // There is definitely a better way to do this
-// void run_powm(const void* modulus, void *inputs, void *results, uint32_t instance_count) {
         run_powm<params>(prime, instances, results_mem, instance_count);
         result->powm_results = results_mem;
         // TODO put the actual error string in here
@@ -363,6 +353,14 @@ extern "C" {
         // Or perhaps the C++ stream i/o can get used instead.
         //snprintf(result->error, errorLen, "changing the test string ROFL\n");
         return result;
+    }
+    // What if it's actually calling printf that's the problem?
+    // Maybe there's some sort of new problem that I haven't been able to
+    // figure out. Incompatible versions of some libraries, maybe?
+    // Let's just try adding a couple numbers and returning that.
+    // Then we can print it in the result
+    int addNumbers(void) {
+      return 2+4;
     }
 }
 
