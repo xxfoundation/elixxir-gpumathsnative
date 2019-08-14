@@ -291,8 +291,7 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   // Currently, we're copying to the modulus before each kernel launch
   // I'm not sure how to handle benchmarking with two groups...
   printf("Copying modulus to the GPU ...\n");
-//  err = CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
-  err = CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, cudaMemcpyHostToDevice));
+  err = CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
   RETURN_IF_EXISTS(err);
 
   // create a cgbn_error_report for CGBN to report back errors
