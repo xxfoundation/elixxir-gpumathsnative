@@ -275,6 +275,7 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   const char *err;
   
   err = CUDA_CHECK(cudaSetDevice(0));
+  RETURN_IF_EXISTS(err);
   printf("Copying inputs to the GPU ...\n");
   // Is this the best way of allocating memory for each kernel launch?
   // Is there actually a perf difference doing things this way vs the AoS allocation style?
@@ -284,9 +285,12 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
   const size_t inputsSize = sizeof(input_t)*instance_count;
   err = CUDA_CHECK(cudaMalloc((void **)&gpuInputs, inputsSize));
+  RETURN_IF_EXISTS(err);
   err = CUDA_CHECK(cudaMalloc((void **)&gpuResults, resultsSize));
+  RETURN_IF_EXISTS(err);
 
   err = CUDA_CHECK(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
+  RETURN_IF_EXISTS(err);
 
   // Currently, we're copying to the modulus before each kernel launch
   // I'm not sure how to handle benchmarking with two groups...
