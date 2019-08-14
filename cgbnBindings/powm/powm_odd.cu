@@ -261,8 +261,9 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
 }
 
 // TODO Is there a way to be type safe without an array of structs setup?
+// Returns error
 template<class params>
-void run_powm(const void* modulus, const void *inputs, void *results, const uint32_t instance_count) {
+const char* run_powm(const void* modulus, const void *inputs, void *results, const uint32_t instance_count) {
   typedef typename powm_odd_t<params>::input_t input_t;
   // TODO Each kernel run should return all errors that occurred during the run in a single string
   
@@ -271,8 +272,9 @@ void run_powm(const void* modulus, const void *inputs, void *results, const uint
   int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
   input_t *gpuInputs;
   cgbn_mem_t<params::BITS> *gpuResults;
+  const char *err;
   
-  CUDA_CHECK(cudaSetDevice(0));
+  err = CUDA_CHECK(cudaSetDevice(0));
   printf("Copying inputs to the GPU ...\n");
   // Is this the best way of allocating memory for each kernel launch?
   // Is there actually a perf difference doing things this way vs the AoS allocation style?
@@ -281,39 +283,49 @@ void run_powm(const void* modulus, const void *inputs, void *results, const uint
   size_t modulusSize = sizeof(cgbn_mem_t<params::BITS>);
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
   const size_t inputsSize = sizeof(input_t)*instance_count;
-  CUDA_CHECK(cudaMalloc((void **)&gpuInputs, inputsSize));
-  CUDA_CHECK(cudaMalloc((void **)&gpuResults, resultsSize));
+  err = CUDA_CHECK(cudaMalloc((void **)&gpuInputs, inputsSize));
+  err = CUDA_CHECK(cudaMalloc((void **)&gpuResults, resultsSize));
 
-  CUDA_CHECK(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
+  err = CUDA_CHECK(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
 
   // Currently, we're copying to the modulus before each kernel launch
   // I'm not sure how to handle benchmarking with two groups...
   printf("Copying modulus to the GPU ...\n");
-  CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
-  
+//  err = CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
+  err = CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, cudaMemcpyHostToDevice));
+  RETURN_IF_EXISTS(err);
+
   // create a cgbn_error_report for CGBN to report back errors
-  CUDA_CHECK(cgbn_error_report_alloc(&report)); 
-  
+  err = CUDA_CHECK(cgbn_error_report_alloc(&report));
+  RETURN_IF_EXISTS(err);
+
   printf("Running GPU kernel ...\n");
   
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
   kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 
   // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
-  CUDA_CHECK(cudaDeviceSynchronize());
-  CGBN_CHECK(report);
-  
+  err = CUDA_CHECK(cudaDeviceSynchronize());
+  RETURN_IF_EXISTS(err);
+  err = CGBN_CHECK(report);
+  RETURN_IF_EXISTS(err);
+
   // copy the results back from gpuMemory
   printf("Copying results back to CPU ...\n");
   // We don't actually need to memcpy anything that's not an output
-  CUDA_CHECK(cudaMemcpy(results, gpuResults, resultsSize, cudaMemcpyDeviceToHost));
+  err = CUDA_CHECK(cudaMemcpy(results, gpuResults, resultsSize, cudaMemcpyDeviceToHost));
+  RETURN_IF_EXISTS(err);
 
   // clean up
   // TODO Instances will now need to be freed manually from the Go side once
   //  GC-tracked copies are made. We will need a new method that calls free on this memory.
-  CUDA_CHECK(cudaFree(gpuInputs));
-  CUDA_CHECK(cudaFree(gpuResults));
-  CUDA_CHECK(cgbn_error_report_free(report));
+  err = CUDA_CHECK(cudaFree(gpuInputs));
+  RETURN_IF_EXISTS(err);
+  err = CUDA_CHECK(cudaFree(gpuResults));
+  RETURN_IF_EXISTS(err);
+  err = CUDA_CHECK(cgbn_error_report_free(report));
+  RETURN_IF_EXISTS(err);
+  return NULL;
 }
 
 // All the methods used in cgo should have extern "C" linkage to avoid
@@ -324,43 +336,15 @@ extern "C" {
     typedef powm_params_t<8, 2048, 5> params;
     struct powm_2048_return {
         void *powm_results;
-        char *error;
+        const char *error;
     };
     powm_2048_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
         printf("Error is after CUDA so call\n");
-        // I don't remember if you can safely cast the result of malloc
-        // Like, I remember seeing somewhere that you're not supposed to do it this way
         powm_2048_return *result = (powm_2048_return*)malloc(sizeof(struct powm_2048_return));
         // Can i get the size of an individual BN in a better way than this?
-        void *results_mem = malloc(params::BITS/8 * instance_count);
-        // Then we need to actually follow all the pointers in the returned struct and free them after all results
-        // are copied in Golang...
-        // Should I use C++ strings here instead of dealing with this C string?
-        // I guess that would depend on how the error reporting works. Could be a use case for stringstream.
-        //int errorLen = 256;
-        //result->error = (char*)malloc(errorLen*sizeof(char));
-        // We're just going to have result be null for now
-        // That should result in a blank error string on the Go side
-        result->error = NULL;
-        // You must free the results from the go side after you copy them
-        // I should make a binding that frees everything
-        // There is definitely a better way to do this
-        run_powm<params>(prime, instances, results_mem, instance_count);
+        void *results_mem = malloc(sizeof(params::BITS/8 * instance_count));
+        result->error = run_powm<params>(prime, instances, results_mem, instance_count);
         result->powm_results = results_mem;
-        // TODO put the actual error string in here
-        // Probably the actual error returning would work better with strncat?
-        // (Is that a safe method to use? C is so mysterious)
-        // Or perhaps the C++ stream i/o can get used instead.
-        //snprintf(result->error, errorLen, "changing the test string ROFL\n");
         return result;
     }
-    // What if it's actually calling printf that's the problem?
-    // Maybe there's some sort of new problem that I haven't been able to
-    // figure out. Incompatible versions of some libraries, maybe?
-    // Let's just try adding a couple numbers and returning that.
-    // Then we can print it in the result
-    int addNumbers(void) {
-      return 2+4;
-    }
 }
-
