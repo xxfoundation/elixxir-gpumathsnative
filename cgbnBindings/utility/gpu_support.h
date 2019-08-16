@@ -22,44 +22,56 @@ IN THE SOFTWARE.
 
 ***/
 
+#include <sstream>
+
 // support routines
-void cuda_check(cudaError_t status, const char *action=NULL, const char *file=NULL, int32_t line=0) {
+// The caller is responsible for freeing the returned string
+const char* cuda_check(cudaError_t status, const char *action=NULL, const char *file=NULL, int32_t line=0) {
   // check for cuda errors
 
   if(status!=cudaSuccess) {
-    printf("CUDA error occurred: %s\n", cudaGetErrorString(status));
-    if(action!=NULL)
-      printf("While running %s   (file %s, line %d)\n", action, file, line);
-    exit(1);
+    std::stringstream errorMsg;
+    errorMsg << "CUDA error occurred: " << cudaGetErrorString(status) << "\n";
+    if(action!=NULL) {
+      errorMsg << "While running " << action << "   (file " << file << ", line " << line << ")" << std::endl;
+    }
+    return strdup(errorMsg.str().c_str());
   }
+  return NULL;
 }
 
-void cgbn_check(cgbn_error_report_t *report, const char *file=NULL, int32_t line=0) {
+// The caller is responsible for freeing the returned string
+const char* cgbn_check(cgbn_error_report_t *report, const char *file=NULL, int32_t line=0) {
   // check for cgbn errors
 
   if(cgbn_error_report_check(report)) {
-    printf("\n");
-    printf("CGBN error occurred: %s\n", cgbn_error_string(report));
+    std::stringstream errorMsg;
+    errorMsg << "CGBN error occurred: " << cgbn_error_string(report) << "\n";
 
     if(report->_instance!=0xFFFFFFFF) {
-      printf("Error reported by instance %d", report->_instance);
+      errorMsg << "Error reported by instance " << report->_instance;
       if(report->_blockIdx.x!=0xFFFFFFFF || report->_threadIdx.x!=0xFFFFFFFF)
-        printf(", ");
+        errorMsg << ", ";
       if(report->_blockIdx.x!=0xFFFFFFFF)
-      printf("blockIdx=(%d, %d, %d) ", report->_blockIdx.x, report->_blockIdx.y, report->_blockIdx.z);
+        errorMsg << "blockIdx=(" << report->_blockIdx.x << ", " << report->_blockIdx.y <<  ", " <<report->_blockIdx.z << ") ";
       if(report->_threadIdx.x!=0xFFFFFFFF)
-        printf("threadIdx=(%d, %d, %d)", report->_threadIdx.x, report->_threadIdx.y, report->_threadIdx.z);
-      printf("\n");
+        errorMsg << "threadIdx=(" << report->_threadIdx.x << ", " << report->_threadIdx.y << ", " << report->_threadIdx.z << ")";
+      errorMsg << std::endl;
     }
     else {
-      printf("Error reported by blockIdx=(%d %d %d)", report->_blockIdx.x, report->_blockIdx.y, report->_blockIdx.z);
-      printf("threadIdx=(%d %d %d)\n", report->_threadIdx.x, report->_threadIdx.y, report->_threadIdx.z);
+      errorMsg << "Error reported by blockIdx=(" << report->_blockIdx.x << " " << report->_blockIdx.y << " " << report->_blockIdx.z << ")";
+      errorMsg << "threadIdx=(" << report->_threadIdx.x << " " << report->_threadIdx.y << " " << report->_threadIdx.z << ")" << std::endl;
     }
     if(file!=NULL)
-      printf("file %s, line %d\n", file, line);
-    exit(1);
+      errorMsg << "file " << file << ", line " << line << std::endl;
+    return strdup(errorMsg.str().c_str());
   }
+  return NULL;
 }
 
 #define CUDA_CHECK(action) cuda_check(action, #action, __FILE__, __LINE__)
 #define CGBN_CHECK(report) cgbn_check(report, __FILE__, __LINE__)
+// Store the returned error message in a variable, rather than wrapping CUDA_CHECK and CGBN_CHECK calls directly
+// Directly wrapping will cause the CHECK calls to be called twice
+#define RETURN_IF_EXISTS(errorMsg) if (errorMsg != NULL) return errorMsg
+#define PRINT_IF_EXISTS(errorMsg) if (errorMsg != NULL) { printf("%s", errorMsg); free((void*)errorMsg); exit(1); }
