@@ -343,9 +343,9 @@ extern "C" {
     };
     powm_2048_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
         printf("Error is after CUDA so call\n");
-        powm_2048_return *result = (powm_2048_return*)malloc(sizeof(struct powm_2048_return));
+        powm_2048_return *result = (powm_2048_return*)malloc(sizeof(*result));
         // Can i get the size of an individual BN in a better way than this?
-        void *results_mem = malloc(sizeof(params::BITS/8 * instance_count));
+        void *results_mem = malloc(params::BITS/8 * instance_count);
         result->error = run_powm<params>(prime, instances, results_mem, instance_count);
         result->powm_results = results_mem;
         return result;
