@@ -267,10 +267,8 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
   input_t *gpuInputs;
   cgbn_mem_t<params::BITS> *gpuResults;
-  const char *err = NULL;
   
-  err = CUDA_CHECK(cudaSetDevice(0));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaSetDevice(0));
   printf("Copying inputs to the GPU ...\n");
   // Is this the best way of allocating memory for each kernel launch?
   // Is there actually a perf difference doing things this way vs the AoS allocation style?
@@ -279,23 +277,18 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   size_t modulusSize = sizeof(cgbn_mem_t<params::BITS>);
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
   const size_t inputsSize = sizeof(input_t)*instance_count;
-  err = CUDA_CHECK(cudaMalloc((void **)&gpuInputs, inputsSize));
-  RETURN_IF_EXISTS(err);
-  err = CUDA_CHECK(cudaMalloc((void **)&gpuResults, resultsSize));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaMalloc((void **)&gpuInputs, inputsSize));
+  CUDA_CHECK_RETURN(cudaMalloc((void **)&gpuResults, resultsSize));
 
-  err = CUDA_CHECK(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
 
   // Currently, we're copying to the modulus before each kernel launch
   // I'm not sure how to handle benchmarking with two groups...
   printf("Copying modulus to the GPU ...\n");
-  err = CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
 
   // create a cgbn_error_report for CGBN to report back errors
-  err = CUDA_CHECK(cgbn_error_report_alloc(&report));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cgbn_error_report_alloc(&report));
 
   printf("Running GPU kernel ...\n");
   
@@ -303,26 +296,20 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 
   // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
-  err = CUDA_CHECK(cudaDeviceSynchronize());
-  RETURN_IF_EXISTS(err);
-  err = CGBN_CHECK(report);
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaDeviceSynchronize());
+  CGBN_CHECK_RETURN(report);
 
   // copy the results back from gpuMemory
   printf("Copying results back to CPU ...\n");
   // We don't actually need to memcpy anything that's not an output
-  err = CUDA_CHECK(cudaMemcpy(results, gpuResults, resultsSize, cudaMemcpyDeviceToHost));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaMemcpy(results, gpuResults, resultsSize, cudaMemcpyDeviceToHost));
 
   // clean up
   // TODO Instances will now need to be freed manually from the Go side once
   //  GC-tracked copies are made. We will need a new method that calls free on this memory.
-  err = CUDA_CHECK(cudaFree(gpuInputs));
-  RETURN_IF_EXISTS(err);
-  err = CUDA_CHECK(cudaFree(gpuResults));
-  RETURN_IF_EXISTS(err);
-  err = CUDA_CHECK(cgbn_error_report_free(report));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaFree(gpuInputs));
+  CUDA_CHECK_RETURN(cudaFree(gpuResults));
+  CUDA_CHECK_RETURN(cgbn_error_report_free(report));
   return NULL;
 }
 

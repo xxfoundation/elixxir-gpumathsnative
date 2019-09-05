@@ -75,3 +75,23 @@ const char* cgbn_check(cgbn_error_report_t *report, const char *file=NULL, int32
 // Directly wrapping will cause the CHECK calls to be called twice
 #define RETURN_IF_EXISTS(errorMsg) if (errorMsg != NULL) return errorMsg
 #define PRINT_IF_EXISTS(errorMsg) if (errorMsg != NULL) { printf("%s", errorMsg); free((void*)errorMsg); exit(1); }
+
+#define CUDA_CHECK_RETURN(action) do { \
+  const char *err = CUDA_CHECK(action); \
+  RETURN_IF_EXISTS(err); \
+} while (0);
+
+#define CUDA_CHECK_PRINT(action) do { \
+  const char *err = CUDA_CHECK(action); \
+  PRINT_IF_EXISTS(err); \
+} while (0);
+
+#define CGBN_CHECK_RETURN(action) do { \
+  const char *err = CGBN_CHECK(action); \
+  RETURN_IF_EXISTS(err); \
+} while (0);
+
+#define CGBN_CHECK_PRINT(action) do { \
+  const char *err = CGBN_CHECK(action); \
+  PRINT_IF_EXISTS(err); \
+} while (0);
