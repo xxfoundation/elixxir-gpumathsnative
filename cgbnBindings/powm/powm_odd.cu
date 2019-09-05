@@ -269,12 +269,7 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   cgbn_mem_t<params::BITS> *gpuResults;
   const char *err = NULL;
   
-<<<<<<< cgbnBindings/powm/powm_odd.cu
   CUDA_CHECK_RETURN(cudaSetDevice(0));
-=======
-  err = CUDA_CHECK(cudaSetDevice(0));
-  RETURN_IF_EXISTS(err);
->>>>>>> cgbnBindings/powm/powm_odd.cu
   printf("Copying inputs to the GPU ...\n");
   // Is this the best way of allocating memory for each kernel launch?
   // Is there actually a perf difference doing things this way vs the AoS allocation style?
@@ -283,37 +278,18 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   size_t modulusSize = sizeof(cgbn_mem_t<params::BITS>);
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
   const size_t inputsSize = sizeof(input_t)*instance_count;
-<<<<<<< cgbnBindings/powm/powm_odd.cu
   CUDA_CHECK_RETURN(cudaMalloc((void **)&gpuInputs, inputsSize));
   CUDA_CHECK_RETURN(cudaMalloc((void **)&gpuResults, resultsSize));
 
   CUDA_CHECK_RETURN(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
-=======
-  err = CUDA_CHECK(cudaMalloc((void **)&gpuInputs, inputsSize));
-  RETURN_IF_EXISTS(err);
-  err = CUDA_CHECK(cudaMalloc((void **)&gpuResults, resultsSize));
-  RETURN_IF_EXISTS(err);
-
-  err = CUDA_CHECK(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
-  RETURN_IF_EXISTS(err);
->>>>>>> cgbnBindings/powm/powm_odd.cu
 
   // Currently, we're copying to the modulus before each kernel launch
   // I'm not sure how to handle benchmarking with two groups...
   printf("Copying modulus to the GPU ...\n");
-<<<<<<< cgbnBindings/powm/powm_odd.cu
   CUDA_CHECK_RETURN(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
 
   // create a cgbn_error_report for CGBN to report back errors
   CUDA_CHECK_RETURN(cgbn_error_report_alloc(&report));
-=======
-  err = CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
-  RETURN_IF_EXISTS(err);
-
-  // create a cgbn_error_report for CGBN to report back errors
-  err = CUDA_CHECK(cgbn_error_report_alloc(&report));
-  RETURN_IF_EXISTS(err);
->>>>>>> cgbnBindings/powm/powm_odd.cu
 
   printf("Running GPU kernel ...\n");
   
@@ -321,41 +297,20 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 
   // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
-<<<<<<< cgbnBindings/powm/powm_odd.cu
   CUDA_CHECK_RETURN(cudaDeviceSynchronize());
   CGBN_CHECK_RETURN(report);
-=======
-  err = CUDA_CHECK(cudaDeviceSynchronize());
-  RETURN_IF_EXISTS(err);
-  err = CGBN_CHECK(report);
-  RETURN_IF_EXISTS(err);
->>>>>>> cgbnBindings/powm/powm_odd.cu
 
   // copy the results back from gpuMemory
   printf("Copying results back to CPU ...\n");
   // We don't actually need to memcpy anything that's not an output
-<<<<<<< cgbnBindings/powm/powm_odd.cu
   CUDA_CHECK_RETURN(cudaMemcpy(results, gpuResults, resultsSize, cudaMemcpyDeviceToHost));
-=======
-  err = CUDA_CHECK(cudaMemcpy(results, gpuResults, resultsSize, cudaMemcpyDeviceToHost));
-  RETURN_IF_EXISTS(err);
->>>>>>> cgbnBindings/powm/powm_odd.cu
 
   // clean up
   // TODO Instances will now need to be freed manually from the Go side once
   //  GC-tracked copies are made. We will need a new method that calls free on this memory.
-<<<<<<< cgbnBindings/powm/powm_odd.cu
   CUDA_CHECK_RETURN(cudaFree(gpuInputs));
   CUDA_CHECK_RETURN(cudaFree(gpuResults));
   CUDA_CHECK_RETURN(cgbn_error_report_free(report));
-=======
-  err = CUDA_CHECK(cudaFree(gpuInputs));
-  RETURN_IF_EXISTS(err);
-  err = CUDA_CHECK(cudaFree(gpuResults));
-  RETURN_IF_EXISTS(err);
-  err = CUDA_CHECK(cgbn_error_report_free(report));
-  RETURN_IF_EXISTS(err);
->>>>>>> cgbnBindings/powm/powm_odd.cu
   return NULL;
 }
 
@@ -372,7 +327,6 @@ extern "C" {
     };
     powm_2048_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
         printf("Error is after CUDA so call\n");
-<<<<<<< cgbnBindings/powm/powm_odd.cu
         powm_2048_return *result = (powm_2048_return*)malloc(sizeof(*result));
         // Can i get the size of an individual BN in a better way than this?
         void *results_mem = malloc(params::BITS/8 * instance_count);
@@ -391,11 +345,6 @@ extern "C" {
         powm_4096_return *result = (powm_4096_return*)malloc(sizeof(*result));
         // Can i get the size of an individual BN in a better way than this?
         void *results_mem = malloc(params::BITS/8 * instance_count);
-=======
-        powm_2048_return *result = (powm_2048_return*)malloc(sizeof(struct powm_2048_return));
-        // Can i get the size of an individual BN in a better way than this?
-        void *results_mem = malloc(sizeof(params::BITS/8 * instance_count));
->>>>>>> cgbnBindings/powm/powm_odd.cu
         result->error = run_powm<params>(prime, instances, results_mem, instance_count);
         result->powm_results = results_mem;
         return result;
