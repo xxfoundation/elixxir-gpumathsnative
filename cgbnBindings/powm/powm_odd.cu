@@ -63,13 +63,8 @@ class powm_params_t {
 // Is there no way to use the class parameters to populate the length of this array?
 // It's a CUDA limitation that __constant__ variables can't be members of a class...
 // We could go with the old-school macro route.
-static __constant__ cgbn_mem_t<2048> MODULUS;    // modulus is the same for all instances, at least during each kernel launch
-                                                 // TODO(nan) Is it a good idea to re-upload the modulus each time?
-                                                 // It's not that much bandwidth required...
-                                                 // how about running the kernel on a smaller and a bigger prime?
-                                                 // what would be the best way to set that up?
-                                                 // Do you just need to have two global variables, one for each modulus?
-                                                 // Maybe the additional limitations that constant variables give aren't worth the extra headache.
+//static __constant__ cgbn_mem_t<2048> MODULUS;    // modulus is the same for all instances, at least during each kernel launch
+static __constant__ cgbn_mem_t<4096> MODULUS;    // modulus is the same for all instances, at least during each kernel launch
 
 template<class params>
 class powm_odd_t {
@@ -272,7 +267,7 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
   input_t *gpuInputs;
   cgbn_mem_t<params::BITS> *gpuResults;
-  const char *err;
+  const char *err = NULL;
   
   err = CUDA_CHECK(cudaSetDevice(0));
   RETURN_IF_EXISTS(err);
@@ -335,8 +330,9 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
 extern "C" {
+    // 2K BITS
     // Can the 2048 be templated?
-    typedef powm_params_t<8, 2048, 5> params;
+/*    typedef powm_params_t<8, 2048, 5> params;
     struct powm_2048_return {
         void *powm_results;
         const char *error;
@@ -349,5 +345,21 @@ extern "C" {
         result->error = run_powm<params>(prime, instances, results_mem, instance_count);
         result->powm_results = results_mem;
         return result;
+    }*/
+
+    // 4K BITS
+    typedef powm_params_t<32, 4096, 5> params;
+    struct powm_4096_return {
+        void *powm_results;
+        const char *error;
+    };
+    powm_4096_return* powm_4096(const void *prime, const void *instances, const uint32_t instance_count) {
+        powm_4096_return *result = (powm_4096_return*)malloc(sizeof(*result));
+        // Can i get the size of an individual BN in a better way than this?
+        void *results_mem = malloc(params::BITS/8 * instance_count);
+        result->error = run_powm<params>(prime, instances, results_mem, instance_count);
+        result->powm_results = results_mem;
+        return result;
     }
 }
+
