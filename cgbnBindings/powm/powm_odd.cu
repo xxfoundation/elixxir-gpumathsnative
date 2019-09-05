@@ -63,13 +63,8 @@ class powm_params_t {
 // Is there no way to use the class parameters to populate the length of this array?
 // It's a CUDA limitation that __constant__ variables can't be members of a class...
 // We could go with the old-school macro route.
-static __constant__ cgbn_mem_t<2048> MODULUS;    // modulus is the same for all instances, at least during each kernel launch
-                                                 // TODO(nan) Is it a good idea to re-upload the modulus each time?
-                                                 // It's not that much bandwidth required...
-                                                 // how about running the kernel on a smaller and a bigger prime?
-                                                 // what would be the best way to set that up?
-                                                 // Do you just need to have two global variables, one for each modulus?
-                                                 // Maybe the additional limitations that constant variables give aren't worth the extra headache.
+//static __constant__ cgbn_mem_t<2048> MODULUS;    // modulus is the same for all instances, at least during each kernel launch
+static __constant__ cgbn_mem_t<4096> MODULUS;    // modulus is the same for all instances, at least during each kernel launch
 
 template<class params>
 class powm_odd_t {
@@ -274,8 +269,7 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   cgbn_mem_t<params::BITS> *gpuResults;
   const char *err = NULL;
   
-  err = CUDA_CHECK(cudaSetDevice(0));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaSetDevice(0));
   printf("Copying inputs to the GPU ...\n");
   // Is this the best way of allocating memory for each kernel launch?
   // Is there actually a perf difference doing things this way vs the AoS allocation style?
@@ -284,23 +278,18 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   size_t modulusSize = sizeof(cgbn_mem_t<params::BITS>);
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
   const size_t inputsSize = sizeof(input_t)*instance_count;
-  err = CUDA_CHECK(cudaMalloc((void **)&gpuInputs, inputsSize));
-  RETURN_IF_EXISTS(err);
-  err = CUDA_CHECK(cudaMalloc((void **)&gpuResults, resultsSize));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaMalloc((void **)&gpuInputs, inputsSize));
+  CUDA_CHECK_RETURN(cudaMalloc((void **)&gpuResults, resultsSize));
 
-  err = CUDA_CHECK(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
 
   // Currently, we're copying to the modulus before each kernel launch
   // I'm not sure how to handle benchmarking with two groups...
   printf("Copying modulus to the GPU ...\n");
-  err = CUDA_CHECK(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
 
   // create a cgbn_error_report for CGBN to report back errors
-  err = CUDA_CHECK(cgbn_error_report_alloc(&report));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cgbn_error_report_alloc(&report));
 
   printf("Running GPU kernel ...\n");
   
@@ -308,26 +297,20 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 
   // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
-  err = CUDA_CHECK(cudaDeviceSynchronize());
-  RETURN_IF_EXISTS(err);
-  err = CGBN_CHECK(report);
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaDeviceSynchronize());
+  CGBN_CHECK_RETURN(report);
 
   // copy the results back from gpuMemory
   printf("Copying results back to CPU ...\n");
   // We don't actually need to memcpy anything that's not an output
-  err = CUDA_CHECK(cudaMemcpy(results, gpuResults, resultsSize, cudaMemcpyDeviceToHost));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaMemcpy(results, gpuResults, resultsSize, cudaMemcpyDeviceToHost));
 
   // clean up
   // TODO Instances will now need to be freed manually from the Go side once
   //  GC-tracked copies are made. We will need a new method that calls free on this memory.
-  err = CUDA_CHECK(cudaFree(gpuInputs));
-  RETURN_IF_EXISTS(err);
-  err = CUDA_CHECK(cudaFree(gpuResults));
-  RETURN_IF_EXISTS(err);
-  err = CUDA_CHECK(cgbn_error_report_free(report));
-  RETURN_IF_EXISTS(err);
+  CUDA_CHECK_RETURN(cudaFree(gpuInputs));
+  CUDA_CHECK_RETURN(cudaFree(gpuResults));
+  CUDA_CHECK_RETURN(cgbn_error_report_free(report));
   return NULL;
 }
 
@@ -335,17 +318,33 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
 extern "C" {
+    // 2K BITS
     // Can the 2048 be templated?
-    typedef powm_params_t<8, 2048, 5> params;
+/*    typedef powm_params_t<8, 2048, 5> params;
     struct powm_2048_return {
         void *powm_results;
         const char *error;
     };
     powm_2048_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
         printf("Error is after CUDA so call\n");
-        powm_2048_return *result = (powm_2048_return*)malloc(sizeof(struct powm_2048_return));
+        powm_2048_return *result = (powm_2048_return*)malloc(sizeof(*result));
         // Can i get the size of an individual BN in a better way than this?
-        void *results_mem = malloc(sizeof(params::BITS/8 * instance_count));
+        void *results_mem = malloc(params::BITS/8 * instance_count);
+        result->error = run_powm<params>(prime, instances, results_mem, instance_count);
+        result->powm_results = results_mem;
+        return result;
+    }*/
+
+    // 4K BITS
+    typedef powm_params_t<32, 4096, 5> params;
+    struct powm_4096_return {
+        void *powm_results;
+        const char *error;
+    };
+    powm_4096_return* powm_4096(const void *prime, const void *instances, const uint32_t instance_count) {
+        powm_4096_return *result = (powm_4096_return*)malloc(sizeof(*result));
+        // Can i get the size of an individual BN in a better way than this?
+        void *results_mem = malloc(params::BITS/8 * instance_count);
         result->error = run_powm<params>(prime, instances, results_mem, instance_count);
         result->powm_results = results_mem;
         return result;
