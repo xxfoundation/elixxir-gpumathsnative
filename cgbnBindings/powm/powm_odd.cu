@@ -60,12 +60,6 @@ class powm_params_t {
   static const uint32_t WINDOW_BITS=window_bits;   // window size
 };
 
-// Is there no way to use the class parameters to populate the length of this array?
-// It's a CUDA limitation that __constant__ variables can't be members of a class...
-// We could go with the old-school macro route.
-//static __constant__ cgbn_mem_t<2048> MODULUS;    // modulus is the same for all instances, at least during each kernel launch
-static __constant__ cgbn_mem_t<4096> MODULUS;    // modulus is the same for all instances, at least during each kernel launch
-
 template<class params>
 class powm_odd_t {
   public:
@@ -90,7 +84,7 @@ class powm_odd_t {
   context_t _context;
   env_t     _env;
   int32_t   _instance;
-  
+
   __device__ __forceinline__ powm_odd_t(cgbn_monitor_t monitor, cgbn_error_report_t *report, int32_t instance) : _context(monitor, report, (uint32_t)instance), _env(_context), _instance(instance) {
   }
 
@@ -229,7 +223,7 @@ class powm_odd_t {
 // Unfortunately, the kernel must be separate from the powm_odd_t class
 // kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 template<class params>
-__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t<params>::input_t *inputs, cgbn_mem_t<params::BITS> *outputs, uint32_t count) {
+__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t<params>::input_t *inputs, cgbn_mem_t<params::BITS> *modulus, cgbn_mem_t<params::BITS> *outputs, uint32_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -244,7 +238,7 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   // here and to pass in and out bignums
   cgbn_load(po._env, x, &(inputs[instance].x));
   cgbn_load(po._env, p, &(inputs[instance].power));
-  cgbn_load(po._env, m, &MODULUS);
+  cgbn_load(po._env, m, modulus);
   
   // this can be either fixed_window_powm_odd or sliding_window_powm_odd.
   // when TPI<32, fixed window runs much faster because it is less divergent, so we use it here
@@ -267,7 +261,7 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
   input_t *gpuInputs;
   cgbn_mem_t<params::BITS> *gpuResults;
-  const char *err = NULL;
+  cgbn_mem_t<params::BITS> *gpuModulus;
   
   CUDA_CHECK_RETURN(cudaSetDevice(0));
   printf("Copying inputs to the GPU ...\n");
@@ -280,13 +274,13 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   const size_t inputsSize = sizeof(input_t)*instance_count;
   CUDA_CHECK_RETURN(cudaMalloc((void **)&gpuInputs, inputsSize));
   CUDA_CHECK_RETURN(cudaMalloc((void **)&gpuResults, resultsSize));
+  CUDA_CHECK_RETURN(cudaMalloc((void **)&gpuModulus, modulusSize));
 
   CUDA_CHECK_RETURN(cudaMemcpy(gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
 
   // Currently, we're copying to the modulus before each kernel launch
   // I'm not sure how to handle benchmarking with two groups...
-  printf("Copying modulus to the GPU ...\n");
-  CUDA_CHECK_RETURN(cudaMemcpyToSymbol(MODULUS, modulus, modulusSize, 0, cudaMemcpyHostToDevice));
+  CUDA_CHECK_RETURN(cudaMemcpy(gpuModulus, modulus, modulusSize, cudaMemcpyHostToDevice));
 
   // create a cgbn_error_report for CGBN to report back errors
   CUDA_CHECK_RETURN(cgbn_error_report_alloc(&report));
@@ -294,7 +288,7 @@ const char* run_powm(const void* modulus, const void *inputs, void *results, con
   printf("Running GPU kernel ...\n");
   
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
-  kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
+  kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuModulus, gpuResults, instance_count);
 
   // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
   CUDA_CHECK_RETURN(cudaDeviceSynchronize());
