@@ -26,6 +26,7 @@ IN THE SOFTWARE.
 #include <stdint.h>
 #include <stdlib.h>
 #include <cuda.h>
+#include <cuda_profiler_api.h>
 #include <gmp.h>
 #include "cgbn/cgbn.h"
 #include "../utility/support.h"
@@ -342,5 +343,21 @@ extern "C" {
         result->error = run_powm<params>(prime, instances, results_mem, instance_count);
         result->powm_results = results_mem;
         return result;
+    }
+
+    // Call this after execution has completed to write out profile information to the disk
+    const char* stopProfiling() {
+        CUDA_CHECK_RETURN(cudaProfilerStop());
+        return NULL;
+    }
+
+    const char* startProfiling() {
+        CUDA_CHECK_RETURN(cudaProfilerStart());
+        return NULL;
+    }
+
+    const char* resetDevice() {
+        CUDA_CHECK_RETURN(cudaDeviceReset());
+        return NULL;
     }
 }
