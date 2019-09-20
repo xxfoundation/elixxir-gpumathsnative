@@ -68,6 +68,8 @@ class powm_odd_t {
 
   // It might be possible to switch to a SOA structure within the instance_t struct
   // Currently, I believe removing this struct completely would make things worse
+  // The main advantage of the current interleaved AOS input structure is that it allows making the 
+  // input memory longer by concatenating byte arrays that represent valid inputs
   // I also need to run benchmarks on an x16 pcie link to make sure we're making the correct pcie bandwidth tradeoff
   // Results shouldn't belong in the instance struct. They should get allocated and written separately, so as to not
   // have to download and uploaded more than is necessary. x and pow should only be uploaded, and results should only
@@ -103,9 +105,6 @@ class powm_odd_t {
     cgbn_store(_env, window+0, t);
     
     // convert x into Montgomery space, store into window table
-    // Conclusion: Right now, only one byte is getting copied by cudaMemcpyToSymbol.
-    //  This will of course result in an error, as there aren't enough bits
-    //  available to do a Montgomery reduction.
     np0=cgbn_bn2mont(_env, result, x, modulus);
     cgbn_store(_env, window+1, result);
     cgbn_set(_env, t, result);
@@ -343,7 +342,6 @@ const char* run_powm(powm_upload_results_t<params> *upload, void *results) {
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
 
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*upload->instance_count;
-  printf("Instance count: %d\n", upload->instance_count);
 
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
   // We'll try a launch with just 1 instance, and see if that access is still illegal
