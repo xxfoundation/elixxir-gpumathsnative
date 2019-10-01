@@ -30,6 +30,7 @@ IN THE SOFTWARE.
 #include <gmp.h>
 #include "cgbn/cgbn.h"
 #include "../utility/support.h"
+#include "powm_odd_export.h"
 
 // For this example, there are quite a few template parameters that are used to generate the actual code.
 // In order to simplify passing many parameters, we use the same approach as the CGBN library, which is to
@@ -367,60 +368,53 @@ const char* run_powm(powm_upload_results_t<params> *upload, void *results) {
   return NULL;
 }
 
+typedef powm_params_t<32, 2048, 5> params2048;
+typedef powm_params_t<32, 4096, 5> params4096;
+
 // All the methods used in cgo should have extern "C" linkage to avoid
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
 extern "C" {
-    // 2K BITS
-    // Can the 2048 be templated?
-/*    typedef powm_params_t<8, 2048, 5> params;
-    struct powm_2048_return {
-        void *powm_results;
-        const char *error;
-    };
-    powm_2048_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
-        printf("Error is after CUDA so call\n");
-        powm_2048_return *result = (powm_2048_return*)malloc(sizeof(*result));
-        // Can i get the size of an individual BN in a better way than this?
-        void *results_mem = malloc(params::BITS/8 * instance_count);
-        result->error = run_powm<params>(prime, instances, results_mem, instance_count);
-        result->powm_results = results_mem;
-        return result;
-    }*/
+  // 2K BITS
+  kernel_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
+    // Upload data
+    auto upload = upload_powm<params2048>(prime, instances, instance_count);
 
-    // 4K BITS
-    typedef powm_params_t<32, 4096, 5> params;
-    struct powm_4096_return {
-        void *powm_results;
-        const char *error;
-    };
-    powm_4096_return* powm_4096(const void *prime, const void *instances, const uint32_t instance_count) {
-        // Upload data
-        auto upload = upload_powm<params>(prime, instances, instance_count);
+    // Run kernel
+    kernel_return *kr = (kernel_return*)malloc(sizeof(*kr));
+    void *results_mem = malloc(sizeof(cgbn_mem_t<2048>) * instance_count);
+    kr->error = run_powm<params2048>(upload, results_mem);
+    kr->results = results_mem;
+    return kr;
+  }
 
-        // Run kernel
-        powm_4096_return *result = (powm_4096_return*)malloc(sizeof(*result));
-        // Can i get the size of an individual BN in a better way than this?
-        void *results_mem = malloc(params::BITS/8 * instance_count);
-        result->error = run_powm<params>(upload, results_mem);
-        result->powm_results = results_mem;
-        return result;
-    }
+  // 4K BITS
+  kernel_return* powm_4096(const void *prime, const void *instances, const uint32_t instance_count) {
+    // Upload data
+    auto upload = upload_powm<params4096>(prime, instances, instance_count);
 
-    // Call this after execution has completed to write out profile information to the disk
-    const char* stopProfiling() {
-        CUDA_CHECK_RETURN(cudaProfilerStop());
-        return NULL;
-    }
+    // Run kernel
+    kernel_return *kr = (kernel_return*)malloc(sizeof(*kr));
+    void *results_mem = malloc(sizeof(cgbn_mem_t<4096>) * instance_count);
+    kr->error = run_powm<params4096>(upload, results_mem);
+    kr->results = results_mem;
+    return kr;
+  }
 
-    const char* startProfiling() {
-        CUDA_CHECK_RETURN(cudaProfilerStart());
-        return NULL;
-    }
+  // Call this after execution has completed to write out profile information to the disk
+  const char* stopProfiling() {
+    CUDA_CHECK_RETURN(cudaProfilerStop());
+    return NULL;
+  }
 
-    const char* resetDevice() {
-        CUDA_CHECK_RETURN(cudaDeviceReset());
-        return NULL;
-    }
+  const char* startProfiling() {
+    CUDA_CHECK_RETURN(cudaProfilerStart());
+    return NULL;
+  }
+
+  const char* resetDevice() {
+    CUDA_CHECK_RETURN(cudaDeviceReset());
+    return NULL;
+  }
 }
 
