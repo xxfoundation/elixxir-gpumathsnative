@@ -6,6 +6,8 @@
 #ifndef POWM_ODD_EXPORT_H
 #define POWM_ODD_EXPORT_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -14,9 +16,9 @@ struct kernel_return {
   const char *error;
 };
 // 2K bits
-kernel_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count);
+struct kernel_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count);
 // 4K bits
-kernel_return* powm_4096(const void *prime, const void *instances, const uint32_t instance_count);
+struct kernel_return* powm_4096(const void *prime, const void *instances, const uint32_t instance_count);
 
 // Call this after execution has completed to write out profile information to the disk
 const char* stopProfiling();
