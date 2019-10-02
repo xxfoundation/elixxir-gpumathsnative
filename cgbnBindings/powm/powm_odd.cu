@@ -346,7 +346,6 @@ const char* run_powm(const powm_upload_results_t<params> *upload, void *results)
   return NULL;
 }
 
-typedef powm_params_t<32, 2048, 5> params2048;
 typedef powm_params_t<32, 4096, 5> params4096;
 
 template<class params>
@@ -382,15 +381,6 @@ inline return_data* upload_export(const void *prime, const void *instances, cons
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
 extern "C" {
-  // 2K BITS
-  return_data* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
-    auto rd = upload_export<params2048>(prime, instances, instance_count);
-    auto runResult = powm_export<params2048>((powm_upload_results_t<params2048>*)rd->result);
-    free(rd->result);
-    return runResult;
-  }
-
-  // 4K BITS
   return_data* powm_4096(const void *prime, const void *instances, const uint32_t instance_count) {
     auto rd = upload_export<params4096>(prime, instances, instance_count);
     auto runResult = powm_export<params4096>((powm_upload_results_t<params4096>*)rd->result);
