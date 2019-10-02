@@ -28,7 +28,7 @@ struct return_data {
 // Upload data for a powm kernel run for 4K bits
 struct return_data* upload_powm_4096(const void *prime, const void *instances, const uint32_t instance_count);
 // Run powm for 4K bits
-struct return_data* run_powm_4096(const void *prime, const void *instances, const uint32_t instance_count);
+struct return_data* run_powm_4096(const void *upload_result);
 
 // Call this after execution has completed to write out profile information to the disk
 const char* stopProfiling();
