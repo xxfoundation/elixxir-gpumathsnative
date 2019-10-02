@@ -260,9 +260,6 @@ struct powm_upload_results_t {
   cgbn_mem_t<params::BITS> *gpuModulus;
   uint32_t instance_count;
   cgbn_error_report_t *report;
-  // If error is set, caller should cudaFree any GPU memory, then free the 
-  // error string and the struct when the error has been handled.
-  const char* error;
 };
 
 // Check error before proceeding
@@ -270,19 +267,20 @@ struct powm_upload_results_t {
 // Clean up struct if error is present
 // Uploads memory from host to device, asynchronously
 // Returns a struct that will contain the necessary parameters to the run function
+// FIXME This should be part of the powm class, right?
+// Returns error
+// Puts resulting valid structure (except in error cases) in last parameter
 template<class params>
-powm_upload_results_t<params>* upload_powm(const void* modulus, const void *inputs, const uint32_t instance_count) {
+const char* upload_powm(const void* modulus, const void *inputs, const uint32_t instance_count, powm_upload_results_t<params>* result) {
   typedef typename powm_odd_t<params>::input_t input_t;
   
-  powm_upload_results_t<params>* result = (powm_upload_results_t<params>*)malloc(sizeof(*result));
   // Set instance count; it's re-used when the kernel gets run later
   result->instance_count = instance_count;
+  // Initialize fields to null
+  // If an error occurs, non-null GPU buffers should be cleaned up by the caller
   
   // Because there aren't multiple return types, this will no longer work
-  result->error = CUDA_CHECK(cudaSetDevice(0));
-  if (result->error != NULL) {
-    return result;
-  }
+  CUDA_CHECK_RETURN(cudaSetDevice(0));
   printf("Copying inputs to the GPU ...\n");
   // Is this the best way of allocating memory for each kernel launch?
   // Is there actually a perf difference doing things this way vs the AoS allocation style?
@@ -291,41 +289,20 @@ powm_upload_results_t<params>* upload_powm(const void* modulus, const void *inpu
   const size_t modulusSize = sizeof(cgbn_mem_t<params::BITS>);
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
   const size_t inputsSize = sizeof(input_t)*instance_count;
-  result->error = CUDA_CHECK(cudaMalloc((void **)&(result->gpuInputs), inputsSize));
-  if (result->error != NULL) {
-    return result;
-  }
-  result->error = CUDA_CHECK(cudaMalloc((void **)&(result->gpuResults), resultsSize));
-  if (result->error != NULL) {
-    return result;
-  }
-  result->error = CUDA_CHECK(cudaMalloc((void **)&(result->gpuModulus), modulusSize));
-  if (result->error != NULL) {
-    return result;
-  }
 
-  result->error = CUDA_CHECK(cudaMemcpy((void *)result->gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
-  if (result->error != NULL) {
-    return result;
-  }
+ CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuInputs), inputsSize));
+  CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuResults), resultsSize));
+  CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuModulus), modulusSize));
+
+  CUDA_CHECK_RETURN(cudaMemcpy((void *)result->gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
 
   // Currently, we're copying to the modulus before each kernel launch
-  // I'm not sure how to handle benchmarking with two groups...
-  // Two groups would require two separate kernel launches, and if they have
-  // different numbers of bits, they would also require two different CGBN
-  // environments... Basically, two different instantiations of the class.
-  result->error = CUDA_CHECK(cudaMemcpy((void *)result->gpuModulus, modulus, modulusSize, cudaMemcpyHostToDevice));
-  if (result->error != NULL) {
-    return result;
-  }
+  CUDA_CHECK_RETURN(cudaMemcpy((void *)result->gpuModulus, modulus, modulusSize, cudaMemcpyHostToDevice));
 
   // create a cgbn_error_report for CGBN to report back errors
-  result->error = CUDA_CHECK(cgbn_error_report_alloc(&(result->report)));
-  if (result->error != NULL) {
-    return result;
-  }
+  CUDA_CHECK_RETURN(cgbn_error_report_alloc(&(result->report)));
 
-  return result;
+  return NULL;
 }
 
 // Run powm kernel
@@ -336,7 +313,9 @@ powm_upload_results_t<params>* upload_powm(const void* modulus, const void *inpu
 // powm_upload_results_t
 // The results will be placed in the passed results pointer after the kernel run
 template<class params>
-const char* run_powm(powm_upload_results_t<params> *upload, void *results) {
+const char* run_powm(const powm_upload_results_t<params> *upload, void *results) {
+  // TODO Wait on upload event to finish before running kernel
+  //  Can't be done until we switch to async uploads
   typedef typename powm_odd_t<params>::input_t input_t;
 
   const int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
@@ -364,41 +343,59 @@ const char* run_powm(powm_upload_results_t<params> *upload, void *results) {
   CUDA_CHECK_RETURN(cudaFree((void*)upload->gpuResults));
   CUDA_CHECK_RETURN(cudaFree((void*)upload->gpuModulus));
   CUDA_CHECK_RETURN(cgbn_error_report_free(upload->report));
-  free(upload);
   return NULL;
 }
 
 typedef powm_params_t<32, 2048, 5> params2048;
 typedef powm_params_t<32, 4096, 5> params4096;
 
+template<class params>
+inline return_data* powm_export(const powm_upload_results_t<params> *upload) {
+  // Run kernel
+  return_data *rd = (return_data*)malloc(sizeof(*rd));
+  auto result_mem = malloc(sizeof(cgbn_mem_t<params::BITS>) * upload->instance_count);
+  rd->error = run_powm<params>(upload, result_mem);
+  rd->result = result_mem;
+  return rd;
+}
+
+template<class params>
+inline return_data* upload_export(const void *prime, const void *instances, const uint32_t instance_count) {
+  // Upload data
+  // TODO Structure this better - upload should return just error, and the
+  //  upload results should be passed in and edited by the method
+  return_data *rd = (return_data*)malloc(sizeof(*rd));
+  auto up = (powm_upload_results_t<params>*)malloc(sizeof(powm_upload_results_t<params>));
+  rd->error = upload_powm<params>(prime, instances, instance_count, up);
+  if (rd->error == NULL) {
+    // Normal case
+    rd->result = up;
+  } else {
+    // Error case
+    rd->result = NULL;
+    // TODO Free non-null buffers
+  }
+  return rd;
+}
+
 // All the methods used in cgo should have extern "C" linkage to avoid
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
 extern "C" {
   // 2K BITS
-  kernel_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
-    // Upload data
-    auto upload = upload_powm<params2048>(prime, instances, instance_count);
-
-    // Run kernel
-    kernel_return *kr = (kernel_return*)malloc(sizeof(*kr));
-    void *results_mem = malloc(sizeof(cgbn_mem_t<2048>) * instance_count);
-    kr->error = run_powm<params2048>(upload, results_mem);
-    kr->results = results_mem;
-    return kr;
+  return_data* powm_2048(const void *prime, const void *instances, const uint32_t instance_count) {
+    auto rd = upload_export<params2048>(prime, instances, instance_count);
+    auto runResult = powm_export<params2048>((powm_upload_results_t<params2048>*)rd->result);
+    free(rd->result);
+    return runResult;
   }
 
   // 4K BITS
-  kernel_return* powm_4096(const void *prime, const void *instances, const uint32_t instance_count) {
-    // Upload data
-    auto upload = upload_powm<params4096>(prime, instances, instance_count);
-
-    // Run kernel
-    kernel_return *kr = (kernel_return*)malloc(sizeof(*kr));
-    void *results_mem = malloc(sizeof(cgbn_mem_t<4096>) * instance_count);
-    kr->error = run_powm<params4096>(upload, results_mem);
-    kr->results = results_mem;
-    return kr;
+  return_data* powm_4096(const void *prime, const void *instances, const uint32_t instance_count) {
+    auto rd = upload_export<params4096>(prime, instances, instance_count);
+    auto runResult = powm_export<params4096>((powm_upload_results_t<params4096>*)rd->result);
+    free(rd->result);
+    return runResult;
   }
 
   // Call this after execution has completed to write out profile information to the disk
