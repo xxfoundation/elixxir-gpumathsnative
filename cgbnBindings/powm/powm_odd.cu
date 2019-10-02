@@ -324,9 +324,12 @@ const char* run_powm(const powm_upload_results_t<params> *upload, void *results)
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*upload->instance_count;
 
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
-  // We'll try a launch with just 1 instance, and see if that access is still illegal
-  // Probably the memory is not getting uploaded all in one chunk, as it should be.
-  kernel_powm_odd<params><<<(upload->instance_count+IPB-1)/IPB, TPB>>>(upload->report, upload->gpuInputs, upload->gpuModulus, upload->gpuResults, upload->instance_count);
+  kernel_powm_odd<params><<<(upload->instance_count+IPB-1)/IPB, TPB>>>(
+    upload->report, 
+    upload->gpuInputs, 
+    upload->gpuModulus, 
+    upload->gpuResults, 
+    upload->instance_count);
 
   // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
   // Note: This should probably only happen in debug builds, as the error 
