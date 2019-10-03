@@ -11,14 +11,24 @@
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
-struct kernel_return {
-  void *results;
+
+// This type works well when returning large chunks of data to Go
+// It's used for the exported bindings for kernel running and data upload
+struct return_data {
+  // It's difficult for Golang to interpret most of this data, so it should
+  // be treated as read-only when the results are used, and unused otherwise.
+  // For instance, the upload result gets passed back to the kernel run 
+  // method, and it shouldn't be modified or the kernel won't run correctly.
+  void *result;
+  // Go should check and handle this like a normal Go error - return, handle,
+  // or panic.
   const char *error;
 };
-// 2K bits
-struct kernel_return* powm_2048(const void *prime, const void *instances, const uint32_t instance_count);
-// 4K bits
-struct kernel_return* powm_4096(const void *prime, const void *instances, const uint32_t instance_count);
+
+// Upload data for a powm kernel run for 4K bits
+struct return_data* upload_powm_4096(const void *prime, const void *instances, const uint32_t instance_count);
+// Run powm for 4K bits
+struct return_data* run_powm_4096(const void *upload_result);
 
 // Call this after execution has completed to write out profile information to the disk
 const char* stopProfiling();
@@ -33,3 +43,4 @@ const char* resetDevice();
 }
 #endif // __cplusplus
 #endif // POWM_ODD_EXPORT_H
+
