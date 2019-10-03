@@ -285,13 +285,11 @@ const char* upload_powm(const void* modulus, const void *inputs, const uint32_t 
   
   // Because there aren't multiple return types, this will no longer work
   CUDA_CHECK_RETURN(cudaSetDevice(0));
-  printf("Copying inputs to the GPU ...\n");
-  // Is this the best way of allocating memory for each kernel launch?
-  // Is there actually a perf difference doing things this way vs the AoS allocation style?
-  // Results will be written to the end of this area of memory
-  // I'm pretty sure this is a dumb way of doing it...
+  // 1 modulus per kernel invocation
   const size_t modulusSize = sizeof(cgbn_mem_t<params::BITS>);
+  // instance_count results per kernel invocation
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
+  // instance_count inputs per kernel invocation
   const size_t inputsSize = sizeof(input_t)*instance_count;
 
   // create a cgbn_error_report for CGBN to report back errors
@@ -325,6 +323,7 @@ const char* run_powm(const powm_upload_results_t<params> *upload, void *results)
   const int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
 
+  // We have instance_count results, each is a certain number of bits wide
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*upload->instance_count;
 
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
