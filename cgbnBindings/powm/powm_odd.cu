@@ -243,9 +243,9 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   
   // this can be either fixed_window_powm_odd or sliding_window_powm_odd.
   // when TPI<32, fixed window runs much faster because it is less divergent, so we use it here
-  po.fixed_window_powm_odd(r, x, p, m);
+  // po.fixed_window_powm_odd(r, x, p, m);
   //   OR
-  // po.sliding_window_powm_odd(r, x, p, m);
+  po.sliding_window_powm_odd(r, x, p, m);
   
   cgbn_store(po._env, &(outputs[instance]), r);
 }
