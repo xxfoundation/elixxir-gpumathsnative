@@ -276,8 +276,12 @@ const char* upload_powm(const void* modulus, const void *inputs, const uint32_t 
   
   // Set instance count; it's re-used when the kernel gets run later
   result->instance_count = instance_count;
-  // Initialize fields to null
+  // Initialize some fields to null
   // If an error occurs, non-null GPU buffers should be cleaned up by the caller
+  result->gpuInputs = NULL;
+  result->gpuResults = NULL;
+  result->gpuModulus = NULL;
+  result->report = NULL;
   
   // Because there aren't multiple return types, this will no longer work
   CUDA_CHECK_RETURN(cudaSetDevice(0));
@@ -290,7 +294,10 @@ const char* upload_powm(const void* modulus, const void *inputs, const uint32_t 
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
   const size_t inputsSize = sizeof(input_t)*instance_count;
 
- CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuInputs), inputsSize));
+  // create a cgbn_error_report for CGBN to report back errors
+  CUDA_CHECK_RETURN(cgbn_error_report_alloc(&(result->report)));
+
+  CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuInputs), inputsSize));
   CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuResults), resultsSize));
   CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuModulus), modulusSize));
 
@@ -298,9 +305,6 @@ const char* upload_powm(const void* modulus, const void *inputs, const uint32_t 
 
   // Currently, we're copying to the modulus before each kernel launch
   CUDA_CHECK_RETURN(cudaMemcpy((void *)result->gpuModulus, modulus, modulusSize, cudaMemcpyHostToDevice));
-
-  // create a cgbn_error_report for CGBN to report back errors
-  CUDA_CHECK_RETURN(cgbn_error_report_alloc(&(result->report)));
 
   return NULL;
 }
@@ -364,8 +368,6 @@ inline return_data* powm_export(const powm_upload_results_t<params> *upload) {
 template<class params>
 inline return_data* upload_export(const void *prime, const void *instances, const uint32_t instance_count) {
   // Upload data
-  // TODO Structure this better - upload should return just error, and the
-  //  upload results should be passed in and edited by the method
   return_data *rd = (return_data*)malloc(sizeof(*rd));
   auto up = (powm_upload_results_t<params>*)malloc(sizeof(powm_upload_results_t<params>));
   rd->error = upload_powm<params>(prime, instances, instance_count, up);
@@ -375,7 +377,21 @@ inline return_data* upload_export(const void *prime, const void *instances, cons
   } else {
     // Error case
     rd->result = NULL;
-    // TODO Free non-null buffers
+    // Attempt to free non-null buffers: if there was an error, the whole 
+    // upload shouldn't be valid, so they're no longer useful
+    if (up->report != NULL) {
+      cgbn_error_report_free(up->report);
+    }
+    if (up->gpuInputs != NULL) {
+      cudaFree(up->gpuInputs);
+    }
+    if (up->gpuModulus != NULL) {
+      cudaFree(up->gpuModulus);
+    }
+    if (up->gpuResults != NULL) {
+      cudaFree(up->gpuResults);
+    }
+    free(up);
   }
   return rd;
 }
