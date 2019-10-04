@@ -243,9 +243,9 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   
   // this can be either fixed_window_powm_odd or sliding_window_powm_odd.
   // when TPI<32, fixed window runs much faster because it is less divergent, so we use it here
-  po.fixed_window_powm_odd(r, x, p, m);
+  // po.fixed_window_powm_odd(r, x, p, m);
   //   OR
-  // po.sliding_window_powm_odd(r, x, p, m);
+  po.sliding_window_powm_odd(r, x, p, m);
   
   cgbn_store(po._env, &(outputs[instance]), r);
 }
@@ -258,8 +258,11 @@ struct powm_upload_results_t {
   cgbn_mem_t<params::BITS> *gpuResults;
   // Number of items: 1
   cgbn_mem_t<params::BITS> *gpuModulus;
+
   uint32_t instance_count;
   cgbn_error_report_t *report;
+  // Wait on this event for uploading to finish
+  cudaEvent_t event;
 };
 
 // Check error before proceeding
@@ -282,8 +285,8 @@ const char* upload_powm(const void* modulus, const void *inputs, const uint32_t 
   result->gpuResults = NULL;
   result->gpuModulus = NULL;
   result->report = NULL;
+  result->event = NULL;
   
-  // Because there aren't multiple return types, this will no longer work
   CUDA_CHECK_RETURN(cudaSetDevice(0));
   // 1 modulus per kernel invocation
   const size_t modulusSize = sizeof(cgbn_mem_t<params::BITS>);
@@ -295,14 +298,26 @@ const char* upload_powm(const void* modulus, const void *inputs, const uint32_t 
   // create a cgbn_error_report for CGBN to report back errors
   CUDA_CHECK_RETURN(cgbn_error_report_alloc(&(result->report)));
 
+  // About cudaEventDisableTiming, not getting timing information from the
+  // event is supposed to give better performance when waiting on it
+  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&result->event, cudaEventDisableTiming));
+
+  // TODO these should belong with a stream and should be allocated and freed
+  //  much less often
   CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuInputs), inputsSize));
   CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuResults), resultsSize));
   CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuModulus), modulusSize));
 
-  CUDA_CHECK_RETURN(cudaMemcpy((void *)result->gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
+  // TODO make which stream these copies happen on controllable from bindings
+  //  Currently, the stream argument is just null
+  CUDA_CHECK_RETURN(cudaMemcpyAsync((void *)result->gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
 
   // Currently, we're copying to the modulus before each kernel launch
-  CUDA_CHECK_RETURN(cudaMemcpy((void *)result->gpuModulus, modulus, modulusSize, cudaMemcpyHostToDevice));
+  CUDA_CHECK_RETURN(cudaMemcpyAsync((void *)result->gpuModulus, modulus, modulusSize, cudaMemcpyHostToDevice));
+
+  // Run should wait on this event for kernel launch
+  // The event should include any memcpys that haven't completed yet
+  CUDA_CHECK_RETURN(cudaEventRecord(result->event));
 
   return NULL;
 }
@@ -325,6 +340,9 @@ const char* run_powm(const powm_upload_results_t<params> *upload, void *results)
 
   // We have instance_count results, each is a certain number of bits wide
   const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*upload->instance_count;
+
+  CUDA_CHECK_RETURN(cudaSetDevice(0));
+  CUDA_CHECK_RETURN(cudaEventSynchronize(upload->event));
 
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
   kernel_powm_odd<params><<<(upload->instance_count+IPB-1)/IPB, TPB>>>(
