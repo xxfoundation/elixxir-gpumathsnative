@@ -298,6 +298,8 @@ const char* upload_powm(const void* modulus, const void *inputs, const uint32_t 
   // create a cgbn_error_report for CGBN to report back errors
   CUDA_CHECK_RETURN(cgbn_error_report_alloc(&(result->report)));
 
+  // About cudaEventDisableTiming, not getting timing information from the
+  // event is supposed to give better performance when waiting on it
   CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&result->event, cudaEventDisableTiming));
 
   // TODO these should belong with a stream and should be allocated and freed
