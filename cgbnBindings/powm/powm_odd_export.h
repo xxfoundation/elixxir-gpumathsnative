@@ -30,6 +30,13 @@ struct return_data* upload_powm_4096(const void *prime, const void *instances, c
 // Run powm for 4K bits
 struct return_data* run_powm_4096(const void *upload_result);
 
+// Call this when starting the program to allocate resources
+// Returns pointer to class and error
+return_data* setupPowm(numStreams int, bitLength int);
+// Call this after execution has completed to deallocate resources
+// Returns error
+const char* destroyPowm(void *instance);
+
 // Call this after execution has completed to write out profile information to the disk
 const char* stopProfiling();
 

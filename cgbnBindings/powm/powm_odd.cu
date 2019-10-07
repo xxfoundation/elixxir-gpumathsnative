@@ -362,11 +362,12 @@ const char* run_powm(const powm_upload_results_t<params> *upload, void *results)
   CUDA_CHECK_RETURN(cudaMemcpy(results, upload->gpuResults, resultsSize, cudaMemcpyDeviceToHost));
 
   // We don't need these GPU buffers anymore, as the kernel has run
-  // Does this free the buffers properly? I have concerns about correctness here
+  // TODO Re-use resources rather than creating or destroying them every time
   CUDA_CHECK_RETURN(cudaFree((void*)upload->gpuInputs));
   CUDA_CHECK_RETURN(cudaFree((void*)upload->gpuResults));
   CUDA_CHECK_RETURN(cudaFree((void*)upload->gpuModulus));
   CUDA_CHECK_RETURN(cgbn_error_report_free(upload->report));
+  CUDA_CHECK_RETURN(cudaEventDestroy(upload->event));
   return NULL;
 }
 
@@ -413,6 +414,82 @@ inline return_data* upload_export(const void *prime, const void *instances, cons
   return rd;
 }
 
+// Call this when starting the program to allocate resources
+// Returns pointer to instance and error
+// bitLength should be a multiple of 32
+template<class params>
+inline const char* createStreamManager(numStreams, bitLength, capacity, streamManager *streams) {
+  streams->numStreams = numStreams;
+  streams->streams = (typeof(streams->streams))malloc(sizeof(*streams->streams)*numStreams);
+  for (int i = 0; i < numStreams; i++) {
+    CUDA_CHECK_RETURN(cudaStreamCreate(&streams->streams[i].stream));
+    CUDA_CHECK_RETURN(cudaMalloc((void **)&(streams->streams[i].gpuInputs), inputsSize));
+    CUDA_CHECK_RETURN(cudaMalloc((void **)&(streams->streams[i].gpuResults), resultsSize));
+    CUDA_CHECK_RETURN(cudaMalloc((void **)&(streams->streams[i].gpuModulus), modulusSize));
+    streams->streams[i].capacity = capacity;
+    streams->streams[i].length = 0;
+    CUDA_CHECK_RETURN(cgbn_error_report_alloc(&streams->streams[i].report));
+    // These events are created without timing data because timing data
+    // hinders performance, and we don't need the timing data.
+    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].hostToDevice), cudaEventDisableTiming));
+    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].exec), cudaEventDisableTiming));
+    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].deviceToHost), cudaEventDisableTiming));
+  }
+  // Upload result should be a pointer to stream manager and an index to the
+  // specific stream's data.
+}
+
+template<class params>
+inline const char* destroyStreamManager(streamManager *streams) {
+  // After program execution, the stream manager is no longer needed, and
+  // should get cleaned up.
+  for (int i = 0; i < streams->numStreams; i++) {
+    CUDA_CHECK_RETURN(cudaFree(streams->streams[i].gpuModulus));
+    CUDA_CHECK_RETURN(cudaFree(streams->streams[i].gpuModulus));
+    CUDA_CHECK_RETURN(cudaFree(streams->streams[i].gpuModulus));
+    CUDA_CHECK_RETURN(cgbn_error_report_free(&streams->streams[i].report));
+    CUDA_CHECK_RETURN(cudaEventDestroy(streams->streams[i].hostToDevice));
+    CUDA_CHECK_RETURN(cudaEventDestroy(streams->streams[i].exec));
+    CUDA_CHECK_RETURN(cudaEventDestroy(streams->streams[i].deviceToHost));
+    free(streams->streams[i]);
+  }
+  free(streams);
+}
+
+// Stream object and associated data for a stream
+template<class params>
+struct streamData {
+  // This CUDA stream; when performing operations, set the current stream to
+  // this one
+  cudaStream_t stream;
+
+  // Number of items is number of instances
+  typename powm_odd_t<params>::input_t *gpuInputs;
+  cgbn_mem_t<params::BITS> *gpuResults;
+  // Number of items is 1
+  cgbn_mem_t<params::BITS> *gpuModulus;
+
+  // Number of items that can be held in the buffers associated with this stream
+  uint32_t capacity;
+  // Number of items to be processed with this part of the stream
+  uint32_t length;
+
+  // Check for CGBN errors after kernel finishes using this
+  cgbn_error_report_t *report;
+  // Synchronize this event to wait for host to device transfer before kernel execution
+  cudaEvent_t hostToDevice;
+  // Synchronize this event to wait for kernel execution to finish before device to host transfer
+  cudaEvent_t exec;
+  // Synchronize this event to wait for downloading to finish before using results
+  cudaEvent_t deviceToHost;
+};
+
+template<class params>
+struct streamManager {
+  uint32_t numStreams;
+  streamData<params> *streams;
+};
+
 // All the methods used in cgo should have extern "C" linkage to avoid
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
@@ -425,6 +502,12 @@ extern "C" {
   // Run powm for 4K bits
   return_data* run_powm_4096(const void *upload_result) {
     return powm_export<params4096>((powm_upload_results_t<params4096>*)upload_result);
+  }
+
+
+  // Call this after execution has completed to deallocate resources
+  // Returns error
+  const char* destroyPowm(void *instance) {
   }
 
   // Call this after execution has completed to write out profile information to the disk
