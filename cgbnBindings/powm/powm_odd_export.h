@@ -29,7 +29,9 @@ struct return_data {
 // Upload data for a powm kernel run for 4K bits
 const char* upload_powm_4096(const void *prime, const void *instances, const uint32_t instance_count, void *stream);
 // Run powm for 4K bits
-struct return_data* run_powm_4096(void *stream);
+const char* run_powm_4096(void *stream);
+// Download results from a previous kernel launch
+struct return_data* download_powm_4096(void *stream);
 
 // These methods query the amount of memory necessary for the GPU buffers from the class
 size_t getConstantsSize_powm4096();

@@ -34,6 +34,7 @@ IN THE SOFTWARE.
 
 
 // Stream object and associated data for a stream
+// This name could perhaps be better...
 struct streamData {
   // This CUDA stream; when performing operations, set the current stream to
   // this one
@@ -357,7 +358,7 @@ const char* upload_powm(const void* modulus, const void *inputs, const uint32_t 
 // The results will be placed in the passed results pointer after the kernel run
 // Precondition: stream should have had upload called.
 template<class params>
-const char* run_powm(streamData *stream, void *results) {
+const char* run_powm(streamData *stream) {
   // TODO Wait on upload event to finish before running kernel
   //  Can't be done until we switch to async uploads
   typedef typename powm_odd_t<params>::input_t input_t;
@@ -367,7 +368,7 @@ const char* run_powm(streamData *stream, void *results) {
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
 
   CUDA_CHECK_RETURN(cudaSetDevice(0));
-  CUDA_CHECK_RETURN(cudaEventSynchronize(stream->hostToDevice));
+  CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->hostToDevice, 0));
 // __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t<params>::input_t *inputs, cgbn_mem_t<params::BITS> *modulus, cgbn_mem_t<params::BITS> *outputs, size_t count) {
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
   kernel_powm_odd<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
@@ -381,6 +382,15 @@ const char* run_powm(streamData *stream, void *results) {
   // Note: This should probably only happen in debug builds, as the error 
   // report might not be necessary in normal usage
   CUDA_CHECK_RETURN(cudaEventRecord(stream->exec, stream->stream));
+
+  return NULL;
+}
+
+// Currently, the download blocks
+// It's possible to make this block separately
+template<class params>
+const char* download_powm(void *results, streamData *stream) {
+  CUDA_CHECK_RETURN(cudaSetDevice(0));
   CUDA_CHECK_RETURN(cudaEventSynchronize(stream->exec));
   CGBN_CHECK_RETURN(stream->report);
 
@@ -393,20 +403,22 @@ const char* run_powm(streamData *stream, void *results) {
 typedef powm_params_t<32, 4096, 5> params4096;
 
 template<class params>
-inline return_data* powm_export(void *stream) {
-  streamData* gpuData = (streamData*)(stream);
-  // Run kernel
-  return_data *rd = (return_data*)malloc(sizeof(*rd));
-  // nanc Kernel results should actually be returned by a different method that waits on the execution and downloads the data
-  auto result_mem = malloc(powm_odd_t<params>::getOutputsSize(gpuData->length));
-  rd->error = run_powm<params>(gpuData, result_mem);
-  rd->result = result_mem;
-  return rd;
+inline const char* run_powm_export(streamData *stream) {
+  return run_powm<params>(stream);
 }
 
 template<class params>
-const char* upload_export(const void *prime, const void *instances, const uint32_t instance_count, void *stream) {
-  return upload_powm<params>(prime, instances, instance_count, (streamData*) stream);
+inline const char* upload_export(const void *prime, const void *instances, const uint32_t instance_count, streamData *stream) {
+  return upload_powm<params>(prime, instances, instance_count, stream);
+}
+
+template<class params>
+inline return_data* download_export(streamData *stream) {
+  return_data* result = (return_data*)malloc(sizeof(*result));
+  // Allocate some memory for the stream to download the results into
+  result->result = malloc(powm_odd_t<params>::getOutputsSize(stream->length));
+  result->error = download_powm<params>(result->result, stream);
+  return result;
 }
 
 // create a bunch of streams and buffers suitable for running a particular kernel
@@ -463,12 +475,16 @@ inline const char* destroyStreamManager(streamManager *streams) {
 extern "C" {
   // Upload data for a powm kernel run for 4K bits
   const char* upload_powm_4096(const void *prime, const void *instances, const uint32_t instance_count, void *stream) {
-    return upload_export<params4096>(prime, instances, instance_count, stream);
+    return upload_export<params4096>(prime, instances, instance_count, (streamData*)stream);
   }
   
   // Run powm for 4K bits
-  return_data* run_powm_4096(void *stream) {
-    return powm_export<params4096>((streamData*)stream);
+  const char* run_powm_4096(void *stream) {
+    return run_powm_export<params4096>((streamData*)stream);
+  }
+
+  struct return_data* download_powm_4096(void *stream) {
+    return download_export<params4096>((streamData*)stream);
   }
 
   // Call this when starting the program to allocate resources
