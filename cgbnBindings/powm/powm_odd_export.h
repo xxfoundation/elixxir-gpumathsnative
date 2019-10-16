@@ -1,12 +1,13 @@
 // This + linking the so should allow Go to use the bindings I've made more easily.
 //
 // We are only going to export the "extern C" linked methods, so let's just put those in the header to start...
-// Nothing with a template can go in this header.
+// Nothing with a template should go in this header.
 
 #ifndef POWM_ODD_EXPORT_H
 #define POWM_ODD_EXPORT_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,16 +27,37 @@ struct return_data {
 };
 
 // Upload data for a powm kernel run for 4K bits
-struct return_data* upload_powm_4096(const void *prime, const void *instances, const uint32_t instance_count);
+const char* upload_powm_4096(const void *prime, const void *instances, const uint32_t instance_count, void *stream);
 // Run powm for 4K bits
-struct return_data* run_powm_4096(const void *upload_result);
+struct return_data* run_powm_4096(void *stream);
+
+// These methods query the amount of memory necessary for the GPU buffers from the class
+size_t getConstantsSize_powm4096();
+size_t getInputsSize_powm4096(size_t length);
+size_t getOutputsSize_powm4096(size_t length);
+
+struct streamManagerCreateInfo {
+  // How many kernels can be invoked at once?
+  size_t numStreams;
+  // How many instances can be invoked in a kernel launch?
+  size_t capacity;
+  // What's the size in bytes of the entire input buffer?
+  size_t inputsSize;
+  // What's the size in bytes of the entire output buffer?
+  size_t outputsSize;
+  // What's the size in bytes of the entire constants buffer?
+  size_t constantsSize;
+};
 
 // Call this when starting the program to allocate resources
 // Returns pointer to class and error
-return_data* setupPowm(numStreams int, bitLength int);
-// Call this after execution has completed to deallocate resources
+struct return_data* createStreamManager(struct streamManagerCreateInfo createInfo);
+// Call this after you're done with the kernel to destroy resources
 // Returns error
-const char* destroyPowm(void *instance);
+const char* destroyStreamManager(void *destroyee);
+
+// Call this to get the next valid stream pointer from the manager
+void* getNextStream(void* streamManager);
 
 // Call this after execution has completed to write out profile information to the disk
 const char* stopProfiling();
