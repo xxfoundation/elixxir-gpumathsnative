@@ -32,6 +32,47 @@ IN THE SOFTWARE.
 #include "../utility/support.h"
 #include "powm_odd_export.h"
 
+
+// Stream object and associated data for a stream
+// This name could perhaps be better...
+struct streamData {
+  // This CUDA stream; when performing operations, set the current stream to
+  // this one
+  cudaStream_t stream;
+
+  // Buffer uploaded to before execution
+  // Contains multiple items
+  void *gpuInputs;
+  // Buffer downloaded from after execution
+  // Contains multiple items
+  void *gpuOutputs;
+  // Data that's the same for all items, uploaded to before execution
+  // For instance, can contain the modulus.
+  // Note: This currently uses global memory, not constant memory.
+  // It isn't a constant buffer.
+  void *gpuConstants;
+
+  // Number of items that can be held in the buffers associated with this stream
+  size_t capacity;
+  // Number of items to be processed with this part of the stream
+  size_t length;
+
+  // Check for CGBN errors after kernel finishes using this
+  cgbn_error_report_t *report;
+  // Synchronize this event to wait for host to device transfer before kernel execution
+  cudaEvent_t hostToDevice;
+  // Synchronize this event to wait for kernel execution to finish before device to host transfer
+  cudaEvent_t exec;
+  // Synchronize this event to wait for downloading to finish before using results
+  cudaEvent_t deviceToHost;
+};
+
+struct streamManager {
+  uint32_t numStreams;
+  uint32_t currentStreamIndex;
+  streamData *streams;
+};
+
 // For this example, there are quite a few template parameters that are used to generate the actual code.
 // In order to simplify passing many parameters, we use the same approach as the CGBN library, which is to
 // create a container class with static constants and then pass the class.
@@ -217,6 +258,22 @@ class powm_odd_t {
       cgbn_set_ui32(_env, result, 1);
     }
   }
+
+  // Convenience methods to calculate required size for inputs, outputs, and constants
+  __host__ static inline size_t getInputsSize(size_t length) {
+    // Each input is the size of an instance
+    return sizeof(input_t) * length;
+  }
+
+  __host__ static inline size_t getOutputsSize(size_t length) {
+    // There's only one number in each output
+    return sizeof(cgbn_mem_t<params::BITS>) * length;
+  }
+
+  __host__ static inline size_t getConstantsSize() {
+    // There's one constant, the modulus
+    return sizeof(cgbn_mem_t<params::BITS>);
+  }
 };
 
 // kernel implementation using cgbn
@@ -224,7 +281,7 @@ class powm_odd_t {
 // Unfortunately, the kernel must be separate from the powm_odd_t class
 // kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 template<class params>
-__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t<params>::input_t *inputs, cgbn_mem_t<params::BITS> *modulus, cgbn_mem_t<params::BITS> *outputs, uint32_t count) {
+__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t<params>::input_t *inputs, cgbn_mem_t<params::BITS> *modulus, cgbn_mem_t<params::BITS> *outputs, size_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -250,21 +307,6 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   cgbn_store(po._env, &(outputs[instance]), r);
 }
 
-// Result of upload_powm
-template<class params>
-struct powm_upload_results_t {
-  // Number of items: instance_count
-  typename powm_odd_t<params>::input_t *gpuInputs;
-  cgbn_mem_t<params::BITS> *gpuResults;
-  // Number of items: 1
-  cgbn_mem_t<params::BITS> *gpuModulus;
-
-  uint32_t instance_count;
-  cgbn_error_report_t *report;
-  // Wait on this event for uploading to finish
-  cudaEvent_t event;
-};
-
 // Check error before proceeding
 // Does async memcpy set the error?
 // Clean up struct if error is present
@@ -273,51 +315,36 @@ struct powm_upload_results_t {
 // FIXME This should be part of the powm class, right?
 // Returns error
 // Puts resulting valid structure (except in error cases) in last parameter
+// TODO This needs the params to the class, and it should also take the class as another template, to get the correct size for inputs and outputs?
 template<class params>
-const char* upload_powm(const void* modulus, const void *inputs, const uint32_t instance_count, powm_upload_results_t<params>* result) {
+const char* upload_powm(const void* modulus, const void *inputs, const uint32_t instance_count, streamData* gpuData) {
   typedef typename powm_odd_t<params>::input_t input_t;
+  // TODO support multiple devices
+  CUDA_CHECK_RETURN(cudaSetDevice(0));
+
+  // Previous download must finish before data are uploaded
+  CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
   
   // Set instance count; it's re-used when the kernel gets run later
-  result->instance_count = instance_count;
-  // Initialize some fields to null
-  // If an error occurs, non-null GPU buffers should be cleaned up by the caller
-  result->gpuInputs = NULL;
-  result->gpuResults = NULL;
-  result->gpuModulus = NULL;
-  result->report = NULL;
-  result->event = NULL;
-  
-  CUDA_CHECK_RETURN(cudaSetDevice(0));
-  // 1 modulus per kernel invocation
-  const size_t modulusSize = sizeof(cgbn_mem_t<params::BITS>);
-  // instance_count results per kernel invocation
-  const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*instance_count;
-  // instance_count inputs per kernel invocation
-  const size_t inputsSize = sizeof(input_t)*instance_count;
+  gpuData->length = instance_count;
+  // If there are more instances uploaded than the stream can handle, that's an error
+  // At least for now
+  if (gpuData->length > gpuData->capacity) {
+    return strdup("upload_powm error: length greater than capacity\n");
+  }
 
-  // create a cgbn_error_report for CGBN to report back errors
-  CUDA_CHECK_RETURN(cgbn_error_report_alloc(&(result->report)));
-
-  // About cudaEventDisableTiming, not getting timing information from the
-  // event is supposed to give better performance when waiting on it
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&result->event, cudaEventDisableTiming));
-
-  // TODO these should belong with a stream and should be allocated and freed
-  //  much less often
-  CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuInputs), inputsSize));
-  CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuResults), resultsSize));
-  CUDA_CHECK_RETURN(cudaMalloc((void **)&(result->gpuModulus), modulusSize));
-
-  // TODO make which stream these copies happen on controllable from bindings
-  //  Currently, the stream argument is just null
-  CUDA_CHECK_RETURN(cudaMemcpyAsync((void *)result->gpuInputs, inputs, inputsSize, cudaMemcpyHostToDevice));
+  CUDA_CHECK_RETURN(cudaMemcpyAsync((void *)gpuData->gpuInputs, inputs,
+        powm_odd_t<params>::getInputsSize(gpuData->length),
+        cudaMemcpyHostToDevice, gpuData->stream));
 
   // Currently, we're copying to the modulus before each kernel launch
-  CUDA_CHECK_RETURN(cudaMemcpyAsync((void *)result->gpuModulus, modulus, modulusSize, cudaMemcpyHostToDevice));
+  // This should technically be unnecessary, but it's not that much data
+  CUDA_CHECK_RETURN(cudaMemcpyAsync((void *)gpuData->gpuConstants, modulus, 
+        powm_odd_t<params>::getConstantsSize(), cudaMemcpyHostToDevice, gpuData->stream));
 
   // Run should wait on this event for kernel launch
   // The event should include any memcpys that haven't completed yet
-  CUDA_CHECK_RETURN(cudaEventRecord(result->event));
+  CUDA_CHECK_RETURN(cudaEventRecord(gpuData->hostToDevice, gpuData->stream));
 
   return NULL;
 }
@@ -329,88 +356,117 @@ const char* upload_powm(const void* modulus, const void *inputs, const uint32_t 
 // The method will only work properly with a valid (i.e. non-error) 
 // powm_upload_results_t
 // The results will be placed in the passed results pointer after the kernel run
+// Precondition: stream should have had upload called.
 template<class params>
-const char* run_powm(const powm_upload_results_t<params> *upload, void *results) {
+const char* run_powm(streamData *stream) {
   // TODO Wait on upload event to finish before running kernel
   //  Can't be done until we switch to async uploads
   typedef typename powm_odd_t<params>::input_t input_t;
+  typedef cgbn_mem_t<params::BITS> num_t;
 
   const int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
 
-  // We have instance_count results, each is a certain number of bits wide
-  const size_t resultsSize = sizeof(cgbn_mem_t<params::BITS>)*upload->instance_count;
-
   CUDA_CHECK_RETURN(cudaSetDevice(0));
-  CUDA_CHECK_RETURN(cudaEventSynchronize(upload->event));
-
+  CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->hostToDevice, 0));
+// __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t<params>::input_t *inputs, cgbn_mem_t<params::BITS> *modulus, cgbn_mem_t<params::BITS> *outputs, size_t count) {
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
-  kernel_powm_odd<params><<<(upload->instance_count+IPB-1)/IPB, TPB>>>(
-    upload->report, 
-    upload->gpuInputs, 
-    upload->gpuModulus, 
-    upload->gpuResults, 
-    upload->instance_count);
+  kernel_powm_odd<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
+    stream->report, 
+    (input_t*)stream->gpuInputs, 
+    (num_t*)stream->gpuConstants, 
+    (num_t*)stream->gpuOutputs, 
+    stream->length);
 
   // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
   // Note: This should probably only happen in debug builds, as the error 
   // report might not be necessary in normal usage
-  CUDA_CHECK_RETURN(cudaDeviceSynchronize());
-  CGBN_CHECK_RETURN(upload->report);
+  CUDA_CHECK_RETURN(cudaEventRecord(stream->exec, stream->stream));
+
+  return NULL;
+}
+
+// Currently, the download blocks
+// It's possible to make this block separately
+template<class params>
+const char* download_powm(void *results, streamData *stream) {
+  CUDA_CHECK_RETURN(cudaSetDevice(0));
+  CUDA_CHECK_RETURN(cudaEventSynchronize(stream->exec));
+  CGBN_CHECK_RETURN(stream->report);
 
   // The kernel ran successfully, so we get the results off the GPU
-  CUDA_CHECK_RETURN(cudaMemcpy(results, upload->gpuResults, resultsSize, cudaMemcpyDeviceToHost));
+  CUDA_CHECK_RETURN(cudaMemcpy(results, stream->gpuOutputs, powm_odd_t<params>::getOutputsSize(stream->length), cudaMemcpyDeviceToHost));
 
-  // We don't need these GPU buffers anymore, as the kernel has run
-  // Does this free the buffers properly? I have concerns about correctness here
-  CUDA_CHECK_RETURN(cudaFree((void*)upload->gpuInputs));
-  CUDA_CHECK_RETURN(cudaFree((void*)upload->gpuResults));
-  CUDA_CHECK_RETURN(cudaFree((void*)upload->gpuModulus));
-  CUDA_CHECK_RETURN(cgbn_error_report_free(upload->report));
   return NULL;
 }
 
 typedef powm_params_t<32, 4096, 5> params4096;
 
 template<class params>
-inline return_data* powm_export(const powm_upload_results_t<params> *upload) {
-  // Run kernel
-  return_data *rd = (return_data*)malloc(sizeof(*rd));
-  auto result_mem = malloc(sizeof(cgbn_mem_t<params::BITS>) * upload->instance_count);
-  rd->error = run_powm<params>(upload, result_mem);
-  rd->result = result_mem;
-  return rd;
+inline const char* run_powm_export(streamData *stream) {
+  return run_powm<params>(stream);
 }
 
 template<class params>
-inline return_data* upload_export(const void *prime, const void *instances, const uint32_t instance_count) {
-  // Upload data
-  return_data *rd = (return_data*)malloc(sizeof(*rd));
-  auto up = (powm_upload_results_t<params>*)malloc(sizeof(powm_upload_results_t<params>));
-  rd->error = upload_powm<params>(prime, instances, instance_count, up);
-  if (rd->error == NULL) {
-    // Normal case
-    rd->result = up;
-  } else {
-    // Error case
-    rd->result = NULL;
-    // Attempt to free non-null buffers: if there was an error, the whole 
-    // upload shouldn't be valid, so they're no longer useful
-    if (up->report != NULL) {
-      cgbn_error_report_free(up->report);
-    }
-    if (up->gpuInputs != NULL) {
-      cudaFree(up->gpuInputs);
-    }
-    if (up->gpuModulus != NULL) {
-      cudaFree(up->gpuModulus);
-    }
-    if (up->gpuResults != NULL) {
-      cudaFree(up->gpuResults);
-    }
-    free(up);
+inline const char* upload_export(const void *prime, const void *instances, const uint32_t instance_count, streamData *stream) {
+  return upload_powm<params>(prime, instances, instance_count, stream);
+}
+
+template<class params>
+inline return_data* download_export(streamData *stream) {
+  return_data* result = (return_data*)malloc(sizeof(*result));
+  // Allocate some memory for the stream to download the results into
+  result->result = malloc(powm_odd_t<params>::getOutputsSize(stream->length));
+  result->error = download_powm<params>(result->result, stream);
+  return result;
+}
+
+// create a bunch of streams and buffers suitable for running a particular kernel
+const char* createStreamManager(streamManagerCreateInfo createInfo, streamManager *streams) {
+  streams->numStreams = createInfo.numStreams;
+  streams->streams = (typeof(streams->streams))malloc(sizeof(*streams->streams)*createInfo.numStreams);
+
+  for (int i = 0; i < createInfo.numStreams; i++) {
+    CUDA_CHECK_RETURN(cudaStreamCreate(&streams->streams[i].stream));
+    CUDA_CHECK_RETURN(cudaMalloc(&(streams->streams[i].gpuInputs), createInfo.inputsSize));
+    CUDA_CHECK_RETURN(cudaMalloc(&(streams->streams[i].gpuOutputs), createInfo.outputsSize));
+    CUDA_CHECK_RETURN(cudaMalloc(&(streams->streams[i].gpuConstants), createInfo.constantsSize));
+    streams->streams[i].capacity = createInfo.capacity;
+    streams->streams[i].length = 0;
+    CUDA_CHECK_RETURN(cgbn_error_report_alloc(&streams->streams[i].report));
+    // These events are created with timing disabled because it takes time 
+    // to get the timing data, and we don't need it.
+    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].hostToDevice), cudaEventDisableTiming));
+    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].exec), cudaEventDisableTiming));
+    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].deviceToHost), cudaEventDisableTiming));
   }
-  return rd;
+  return NULL;
+}
+
+// allocate the data necessary to return a stream manager with an error across the bindings
+return_data* createStreamManager_export(streamManagerCreateInfo createInfo) {
+  return_data* result = (return_data*)malloc(sizeof(*result));
+  streamManager *sm = (streamManager*)(malloc(sizeof(*sm)));
+  result->error = createStreamManager(createInfo, sm);
+  result->result = sm;
+  return result;
+}
+
+// free the space used by a stream manager that's no longer in use
+inline const char* destroyStreamManager(streamManager *streams) {
+  // After the program's done with this kernel, the stream manager is no 
+  // longer needed, and should get cleaned up.
+  for (int i = 0; i < streams->numStreams; i++) {
+    CUDA_CHECK_RETURN(cudaFree(streams->streams[i].gpuInputs));
+    CUDA_CHECK_RETURN(cudaFree(streams->streams[i].gpuOutputs));
+    CUDA_CHECK_RETURN(cudaFree(streams->streams[i].gpuConstants));
+    CUDA_CHECK_RETURN(cgbn_error_report_free(streams->streams[i].report));
+    CUDA_CHECK_RETURN(cudaEventDestroy(streams->streams[i].hostToDevice));
+    CUDA_CHECK_RETURN(cudaEventDestroy(streams->streams[i].exec));
+    CUDA_CHECK_RETURN(cudaEventDestroy(streams->streams[i].deviceToHost));
+  }
+  free((void*)streams);
+  return NULL;
 }
 
 // All the methods used in cgo should have extern "C" linkage to avoid
@@ -418,13 +474,29 @@ inline return_data* upload_export(const void *prime, const void *instances, cons
 // This makes them more straightforward to load from the shared object
 extern "C" {
   // Upload data for a powm kernel run for 4K bits
-  return_data* upload_powm_4096(const void *prime, const void *instances, const uint32_t instance_count) {
-    return upload_export<params4096>(prime, instances, instance_count);
+  const char* upload_powm_4096(const void *prime, const void *instances, const uint32_t instance_count, void *stream) {
+    return upload_export<params4096>(prime, instances, instance_count, (streamData*)stream);
   }
   
   // Run powm for 4K bits
-  return_data* run_powm_4096(const void *upload_result) {
-    return powm_export<params4096>((powm_upload_results_t<params4096>*)upload_result);
+  const char* run_powm_4096(void *stream) {
+    return run_powm_export<params4096>((streamData*)stream);
+  }
+
+  struct return_data* download_powm_4096(void *stream) {
+    return download_export<params4096>((streamData*)stream);
+  }
+
+  // Call this when starting the program to allocate resources
+  // Returns pointer to class and error
+  struct return_data* createStreamManager(streamManagerCreateInfo createInfo) {
+    return createStreamManager_export(createInfo);
+  }
+
+  // Call this after execution has completed to deallocate resources
+  // Returns error
+  const char* destroyStreamManager(void *destroyee) {
+    return destroyStreamManager((streamManager*)(destroyee));
   }
 
   // Call this after execution has completed to write out profile information to the disk
@@ -441,6 +513,27 @@ extern "C" {
   const char* resetDevice() {
     CUDA_CHECK_RETURN(cudaDeviceReset());
     return NULL;
+  }
+
+  size_t getConstantsSize_powm4096() {
+    return powm_odd_t<params4096>::getConstantsSize();
+  }
+
+  size_t getInputsSize_powm4096(size_t length) {
+    return powm_odd_t<params4096>::getInputsSize(length);
+  }
+  
+  size_t getOutputsSize_powm4096(size_t length) {
+    return powm_odd_t<params4096>::getOutputsSize(length);
+  }
+
+  // These are void pointers instead of real types, because the Golang bindings shouldn't
+  // be doing anything with them other than passing them to this library
+  void* getNextStream(void* pStreamManager) {
+    streamManager *sm = (streamManager*)pStreamManager;
+    uint32_t nextStreamIndex = (sm->currentStreamIndex + 1) % sm->numStreams;
+    sm->currentStreamIndex = nextStreamIndex;
+    return (void*)(&sm->streams[nextStreamIndex]);
   }
 }
 
