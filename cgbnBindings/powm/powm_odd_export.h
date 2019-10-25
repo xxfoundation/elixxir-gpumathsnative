@@ -27,11 +27,13 @@ struct return_data {
 };
 
 // Upload data for a powm kernel run for 4K bits
-const char* upload_powm_4096(const void *prime, const void *instances, const uint32_t instance_count, void *stream);
+const char* upload_powm_4096(const uint32_t instance_count, void *stream);
 // Run powm for 4K bits
 const char* run_powm_4096(void *stream);
-// Download results from a previous kernel launch
-struct return_data* download_powm_4096(void *stream);
+// Enqueue download from a previous kernel launch
+const char* download_powm_4096(void *stream);
+// Wait for a results download to finish
+struct return_data* getResults_powm(void *stream);
 
 // These methods query the amount of memory necessary for the GPU buffers from the class
 size_t getConstantsSize_powm4096();
@@ -51,6 +53,7 @@ struct streamManagerCreateInfo {
   size_t constantsSize;
 };
 
+
 // Call this when starting the program to allocate resources
 // Returns pointer to class and error
 struct return_data* createStreamManager(struct streamManagerCreateInfo createInfo);
@@ -60,6 +63,18 @@ const char* destroyStreamManager(void *destroyee);
 
 // Call this to get the next valid stream pointer from the manager
 void* getNextStream(void* streamManager);
+
+// Get a pointer to the CPU inputs buffer from a stream
+// Overwrite this memory with inputs before enqueueing an upload
+void* getCpuInputs(void* stream);
+
+// Get a pointer to the CPU outputs buffer from a stream
+// Read outputs from this memory after calling getResults to synchronize the event
+void* getCpuOutputs(void* stream);
+
+// Get a pointer to the CPU constants buffer from a stream
+// Overwrite this memory with constants before enqueueing an upload
+void* getCpuConstants(void* stream);
 
 // Call this after execution has completed to write out profile information to the disk
 const char* stopProfiling();
