@@ -447,9 +447,9 @@ const char* createStreamManager(streamManagerCreateInfo createInfo, streamManage
 
     // These events are created with timing disabled because it takes time 
     // to get the timing data, and we don't need it.
-    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].hostToDevice), cudaEventDisableTiming));
-    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].exec), cudaEventDisableTiming));
-    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].deviceToHost), cudaEventDisableTiming));
+    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].hostToDevice), cudaEventDisableTiming|cudaEventBlockingSync));
+    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].exec), cudaEventDisableTiming|cudaEventBlockingSync));
+    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].deviceToHost), cudaEventDisableTiming|cudaEventBlockingSync));
   }
   return NULL;
 }
