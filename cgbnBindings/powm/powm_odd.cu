@@ -72,12 +72,6 @@ struct streamData {
   cudaEvent_t deviceToHost;
 };
 
-struct streamManager {
-  uint32_t numStreams;
-  uint32_t currentStreamIndex;
-  streamData *streams;
-};
-
 // For this example, there are quite a few template parameters that are used to generate the actual code.
 // In order to simplify passing many parameters, we use the same approach as the CGBN library, which is to
 // create a container class with static constants and then pass the class.
@@ -354,8 +348,6 @@ const char* upload_powm(const uint32_t instance_count, streamData* gpuData) {
 // Precondition: stream should have had upload called.
 template<class params>
 const char* run_powm(streamData *stream) {
-  // TODO Wait on upload event to finish before running kernel
-  //  Can't be done until we switch to async uploads
   typedef typename powm_odd_t<params>::input_t input_t;
   typedef cgbn_mem_t<params::BITS> num_t;
 
@@ -427,59 +419,52 @@ inline return_data* getResults_powm_export(streamData *stream) {
 
 
 // create a bunch of streams and buffers suitable for running a particular kernel
-const char* createStreamManager(streamManagerCreateInfo createInfo, streamManager *streams) {
-  streams->numStreams = createInfo.numStreams;
-  streams->streams = (typeof(streams->streams))malloc(sizeof(*streams->streams)*createInfo.numStreams);
+inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
+  CUDA_CHECK_RETURN(cudaStreamCreate(&(stream->stream)));
+  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuInputs), createInfo.inputsSize));
+  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuOutputs), createInfo.outputsSize));
+  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuConstants), createInfo.constantsSize));
+  stream->capacity = createInfo.capacity;
+  stream->length = 0;
+  CUDA_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
+  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuOutputs), createInfo.outputsSize, cudaHostAllocDefault));
 
-  for (int i = 0; i < createInfo.numStreams; i++) {
-    CUDA_CHECK_RETURN(cudaStreamCreate(&streams->streams[i].stream));
-    CUDA_CHECK_RETURN(cudaMalloc(&(streams->streams[i].gpuInputs), createInfo.inputsSize));
-    CUDA_CHECK_RETURN(cudaMalloc(&(streams->streams[i].gpuOutputs), createInfo.outputsSize));
-    CUDA_CHECK_RETURN(cudaMalloc(&(streams->streams[i].gpuConstants), createInfo.constantsSize));
-    streams->streams[i].capacity = createInfo.capacity;
-    streams->streams[i].length = 0;
-    CUDA_CHECK_RETURN(cgbn_error_report_alloc(&streams->streams[i].report));
-    CUDA_CHECK_RETURN(cudaHostAlloc(&(streams->streams[i].cpuOutputs), createInfo.outputsSize, cudaHostAllocDefault));
+  // Both of these next buffers should only be written on the host, so they can be allocated write-combined
+  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuInputs), createInfo.inputsSize, cudaHostAllocWriteCombined));
+  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuConstants), createInfo.constantsSize, cudaHostAllocWriteCombined));
 
-    // Both of these next buffers should only be written on the host, so they can be allocated write-combined
-    CUDA_CHECK_RETURN(cudaHostAlloc(&(streams->streams[i].cpuInputs), createInfo.inputsSize, cudaHostAllocWriteCombined));
-    CUDA_CHECK_RETURN(cudaHostAlloc(&(streams->streams[i].cpuConstants), createInfo.constantsSize, cudaHostAllocWriteCombined));
+  // These events are created with timing disabled because it takes time 
+  // to get the timing data, and we don't need it.
+  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->hostToDevice), cudaEventDisableTiming|cudaEventBlockingSync));
+  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->exec), cudaEventDisableTiming|cudaEventBlockingSync));
+  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->deviceToHost), cudaEventDisableTiming|cudaEventBlockingSync));
 
-    // These events are created with timing disabled because it takes time 
-    // to get the timing data, and we don't need it.
-    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].hostToDevice), cudaEventDisableTiming|cudaEventBlockingSync));
-    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].exec), cudaEventDisableTiming|cudaEventBlockingSync));
-    CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(streams->streams[i].deviceToHost), cudaEventDisableTiming|cudaEventBlockingSync));
-  }
   return NULL;
 }
 
 // allocate the data necessary to return a stream manager with an error across the bindings
-return_data* createStreamManager_export(streamManagerCreateInfo createInfo) {
+return_data* createStream_export(streamCreateInfo createInfo) {
   return_data* result = (return_data*)malloc(sizeof(*result));
-  streamManager *sm = (streamManager*)(malloc(sizeof(*sm)));
-  result->error = createStreamManager(createInfo, sm);
-  result->result = sm;
+  streamData *s = (streamData*)(malloc(sizeof(*s)));
+  result->error = createStream(createInfo, s);
+  result->result = s;
   return result;
 }
 
-// free the space used by a stream manager that's no longer in use
-inline const char* destroyStreamManager(streamManager *streams) {
-  // After the program's done with this kernel, the stream manager is no 
-  // longer needed, and should get cleaned up.
-  for (int i = 0; i < streams->numStreams; i++) {
-    CUDA_CHECK_RETURN(cudaFree(streams->streams[i].gpuInputs));
-    CUDA_CHECK_RETURN(cudaFree(streams->streams[i].gpuOutputs));
-    CUDA_CHECK_RETURN(cudaFree(streams->streams[i].gpuConstants));
-    CUDA_CHECK_RETURN(cudaFreeHost(streams->streams[i].cpuInputs));
-    CUDA_CHECK_RETURN(cudaFreeHost(streams->streams[i].cpuOutputs));
-    CUDA_CHECK_RETURN(cudaFreeHost(streams->streams[i].cpuConstants));
-    CUDA_CHECK_RETURN(cgbn_error_report_free(streams->streams[i].report));
-    CUDA_CHECK_RETURN(cudaEventDestroy(streams->streams[i].hostToDevice));
-    CUDA_CHECK_RETURN(cudaEventDestroy(streams->streams[i].exec));
-    CUDA_CHECK_RETURN(cudaEventDestroy(streams->streams[i].deviceToHost));
-  }
-  free((void*)streams);
+// free the space used by a stream
+inline const char* destroyStream(streamData *stream) {
+  CUDA_CHECK_RETURN(cudaFree(stream->gpuInputs));
+  CUDA_CHECK_RETURN(cudaFree(stream->gpuOutputs));
+  CUDA_CHECK_RETURN(cudaFree(stream->gpuConstants));
+  CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuInputs));
+  CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuOutputs));
+  CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuConstants));
+  CUDA_CHECK_RETURN(cgbn_error_report_free(stream->report));
+  CUDA_CHECK_RETURN(cudaEventDestroy(stream->hostToDevice));
+  CUDA_CHECK_RETURN(cudaEventDestroy(stream->exec));
+  CUDA_CHECK_RETURN(cudaEventDestroy(stream->deviceToHost));
+  free((void*)stream);
+
   return NULL;
 }
 
@@ -508,14 +493,14 @@ extern "C" {
 
   // Call this when starting the program to allocate resources
   // Returns pointer to class and error
-  struct return_data* createStreamManager(streamManagerCreateInfo createInfo) {
-    return createStreamManager_export(createInfo);
+  struct return_data* createStream(streamCreateInfo createInfo) {
+    return createStream_export(createInfo);
   }
 
   // Call this after execution has completed to deallocate resources
   // Returns error
-  const char* destroyStreamManager(void *destroyee) {
-    return destroyStreamManager((streamManager*)(destroyee));
+  const char* destroyStream(void *destroyee) {
+    return destroyStream((streamData*)(destroyee));
   }
 
   // Call this after execution has completed to write out profile information to the disk
@@ -544,15 +529,6 @@ extern "C" {
   
   size_t getOutputsSize_powm4096(size_t length) {
     return powm_odd_t<params4096>::getOutputsSize(length);
-  }
-
-  // These are void pointers instead of real types, because the Golang bindings shouldn't
-  // be doing anything with them other than passing them to this library
-  void* getNextStream(void* pStreamManager) {
-    streamManager *sm = (streamManager*)pStreamManager;
-    uint32_t nextStreamIndex = (sm->currentStreamIndex + 1) % sm->numStreams;
-    sm->currentStreamIndex = nextStreamIndex;
-    return (void*)(&sm->streams[nextStreamIndex]);
   }
 
   // Return cpu inputs buffer pointer for writing

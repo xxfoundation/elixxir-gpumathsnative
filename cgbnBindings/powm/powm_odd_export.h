@@ -40,9 +40,7 @@ size_t getConstantsSize_powm4096();
 size_t getInputsSize_powm4096(size_t length);
 size_t getOutputsSize_powm4096(size_t length);
 
-struct streamManagerCreateInfo {
-  // How many kernels can be invoked at once?
-  size_t numStreams;
+struct streamCreateInfo {
   // How many instances can be invoked in a kernel launch?
   size_t capacity;
   // What's the size in bytes of the entire input buffer?
@@ -55,14 +53,11 @@ struct streamManagerCreateInfo {
 
 
 // Call this when starting the program to allocate resources
-// Returns pointer to class and error
-struct return_data* createStreamManager(struct streamManagerCreateInfo createInfo);
+// Returns pointer to stream and error
+struct return_data* createStream(struct streamCreateInfo createInfo);
 // Call this after you're done with the kernel to destroy resources
 // Returns error
-const char* destroyStreamManager(void *destroyee);
-
-// Call this to get the next valid stream pointer from the manager
-void* getNextStream(void* streamManager);
+const char* destroyStream(void *destroyee);
 
 // Get a pointer to the CPU inputs buffer from a stream
 // Overwrite this memory with inputs before enqueueing an upload
