@@ -420,12 +420,12 @@ inline return_data* getResults_powm_export(streamData *stream) {
 
 // create a bunch of streams and buffers suitable for running a particular kernel
 inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
+  stream->capacity = createInfo.capacity;
+  stream->length = 0;
   CUDA_CHECK_RETURN(cudaStreamCreate(&(stream->stream)));
   CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuInputs), createInfo.inputsSize));
   CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuOutputs), createInfo.outputsSize));
   CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuConstants), createInfo.constantsSize));
-  stream->capacity = createInfo.capacity;
-  stream->length = 0;
   CUDA_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
   CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuOutputs), createInfo.outputsSize, cudaHostAllocDefault));
 
@@ -435,6 +435,7 @@ inline const char* createStream(streamCreateInfo createInfo, streamData* stream)
 
   // These events are created with timing disabled because it takes time 
   // to get the timing data, and we don't need it.
+  // cudaEventBlockingSync also prevents 100% cpu usage when synchronizing on an event
   CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->hostToDevice), cudaEventDisableTiming|cudaEventBlockingSync));
   CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->exec), cudaEventDisableTiming|cudaEventBlockingSync));
   CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->deviceToHost), cudaEventDisableTiming|cudaEventBlockingSync));
@@ -451,19 +452,43 @@ return_data* createStream_export(streamCreateInfo createInfo) {
   return result;
 }
 
-// free the space used by a stream
+// free a stream
 inline const char* destroyStream(streamData *stream) {
-  CUDA_CHECK_RETURN(cudaFree(stream->gpuInputs));
-  CUDA_CHECK_RETURN(cudaFree(stream->gpuOutputs));
-  CUDA_CHECK_RETURN(cudaFree(stream->gpuConstants));
-  CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuInputs));
-  CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuOutputs));
-  CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuConstants));
-  CUDA_CHECK_RETURN(cgbn_error_report_free(stream->report));
-  CUDA_CHECK_RETURN(cudaEventDestroy(stream->hostToDevice));
-  CUDA_CHECK_RETURN(cudaEventDestroy(stream->exec));
-  CUDA_CHECK_RETURN(cudaEventDestroy(stream->deviceToHost));
-  free((void*)stream);
+  // Don't know at what point there could have been errors while creating this stream,
+  // so make sure things exist before destroying them
+  if (stream != NULL) {
+    if (stream->gpuInputs != NULL) {
+      CUDA_CHECK_RETURN(cudaFree(stream->gpuInputs));
+    }
+    if (stream->gpuOutputs != NULL) {
+      CUDA_CHECK_RETURN(cudaFree(stream->gpuOutputs));
+    }
+    if (stream->gpuConstants != NULL) {
+      CUDA_CHECK_RETURN(cudaFree(stream->gpuConstants));
+    }
+    if (stream->cpuInputs != NULL) {
+      CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuInputs));
+    }
+    if (stream->cpuOutputs != NULL) {
+      CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuOutputs));
+    }
+    if (stream->cpuConstants != NULL) {
+      CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuConstants));
+    }
+    if (stream->report != NULL) {
+      CUDA_CHECK_RETURN(cgbn_error_report_free(stream->report));
+    }
+    if (stream->hostToDevice != NULL) {
+      CUDA_CHECK_RETURN(cudaEventDestroy(stream->hostToDevice));
+    }
+    if (stream->exec != NULL) {
+      CUDA_CHECK_RETURN(cudaEventDestroy(stream->exec));
+    }
+    if (stream->deviceToHost != NULL) {
+      CUDA_CHECK_RETURN(cudaEventDestroy(stream->deviceToHost));
+    }
+    free((void*)stream);
+  }
 
   return NULL;
 }
