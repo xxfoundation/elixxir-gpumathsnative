@@ -57,6 +57,16 @@ struct streamData {
   void *cpuInputs;
   void *cpuConstants;
 
+  // Size of buffers at max capacity (set at creation time)
+  size_t inputsCapacity;
+  size_t outputsCapacity;
+  size_t constantsCapacity;
+
+  // Size of uploads and downloads for this launch (set at upload time)
+  size_t inputsLength;
+  size_t outputsLength;
+  size_t constantsLength;
+
   // Number of items that can be held in the buffers associated with this stream
   size_t capacity;
   // Number of items to be processed with this part of the stream
@@ -307,10 +317,8 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
 }
 
 // Enqueue a host-to-device transfer before a kernel run
-template<class params>
-const char* upload_powm(const uint32_t instance_count, streamData* gpuData) {
-  typedef typename powm_odd_t<params>::input_t input_t;
-
+// Should work for any kernel that's compatible with streamData type
+const char* upload(const uint32_t instance_count, streamData* gpuData, size_t inputsUploadSize, size_t constantsUploadSize, size_t outputsDownloadSize) {
   // Previous download must finish before data are uploaded
   CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
   
@@ -321,15 +329,30 @@ const char* upload_powm(const uint32_t instance_count, streamData* gpuData) {
   if (gpuData->length > gpuData->capacity) {
     return strdup("upload_powm error: length greater than capacity\n");
   }
+  // It also doesn't take too long to bounds check the requested data transfer sizes
+  // to avoid segmentation faults
+  if (gpuData->inputsCapacity < inputsUploadSize) {
+    return strdup("upload error: input upload size greater than capacity\n");
+  }
+  if (gpuData->constantsCapacity < constantsUploadSize) {
+    return strdup("upload error: constants upload size greater than capacity\n");
+  }
+  if (gpuData->outputsCapacity < outputsDownloadSize) {
+    return strdup("upload error: outputs download size greater than capacity\n");
+  }
 
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuInputs, gpuData->cpuInputs,
-        powm_odd_t<params>::getInputsSize(gpuData->length),
+  // At this point, everything should be in a good state, so set the needed variables
+  gpuData->inputsLength = inputsUploadSize;
+  gpuData->outputsLength = outputsDownloadSize;
+  gpuData->constantsLength = constantsUploadSize;
+
+  CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuInputs, gpuData->cpuInputs, gpuData->inputsLength,
         cudaMemcpyHostToDevice, gpuData->stream));
 
-  // Currently, we're copying to the modulus before each kernel launch
-  // This should technically be unnecessary, but it's not that much data
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuConstants, gpuData->cpuConstants, 
-        powm_odd_t<params>::getConstantsSize(), cudaMemcpyHostToDevice, gpuData->stream));
+  // Currently, we're copying to the constants before each kernel launch
+  // This might not be necessary, but it's not that much data
+  CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuConstants, gpuData->cpuConstants, gpuData->constantsLength,
+        cudaMemcpyHostToDevice, gpuData->stream));
 
   // Run should wait on this event for kernel launch
   // The event should include any memcpys that haven't completed yet
@@ -340,22 +363,20 @@ const char* upload_powm(const uint32_t instance_count, streamData* gpuData) {
 
 // Run powm kernel
 // Enqueues kernel on the stream and returns immediately (non-blocking)
-// To call this, you should have prepared a kernel launch with upload_powm
-// and waited for the returned struct to be populated
-// The method will only work properly with a valid (i.e. non-error) 
-// powm_upload_results_t
-// The results will be placed in the passed results pointer after the kernel run
-// Precondition: stream should have had upload called.
+// The results will be placed in the stream's gpu outputs buffer some time after the kernel launch
+// Precondition: stream should have had upload called on it
 template<class params>
-const char* run_powm(streamData *stream) {
-  typedef typename powm_odd_t<params>::input_t input_t;
-  typedef cgbn_mem_t<params::BITS> num_t;
-
+const char* run(streamData *stream, kernel whichToRun) {
   const int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
 
   CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->hostToDevice, 0));
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
+  // TODO We should be able to launch more than just this kernel.
+  //  Organize with enumeration? Is it possible to use templates to make this better?
+  typedef typename powm_odd_t<params>::input_t input_t;
+  typedef cgbn_mem_t<params::BITS> num_t;
+
   kernel_powm_odd<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
     stream->report, 
     (input_t*)stream->gpuInputs, 
@@ -363,57 +384,37 @@ const char* run_powm(streamData *stream) {
     (num_t*)stream->gpuOutputs, 
     stream->length);
 
-  // error report uses managed memory, so we sync the device (or stream) and check for cgbn errors
-  // Note: This should probably only happen in debug builds, as the error 
-  // report might not be necessary in normal usage
   CUDA_CHECK_RETURN(cudaEventRecord(stream->exec, stream->stream));
 
   return NULL;
 }
 
-// Currently, the download blocks
-// It's possible to make this block separately
-template<class params>
 // Enqueue a download of the results after the kernel finishes running
-const char* download_powm(streamData *stream) {
+const char* download(streamData *stream) {
   // Wait for the kernel to finish running
   CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
 
   // The kernel ran successfully, so we get the results off the GPU
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(stream->cpuOutputs, stream->gpuOutputs, powm_odd_t<params>::getOutputsSize(stream->length), cudaMemcpyDeviceToHost, stream->stream));
+  CUDA_CHECK_RETURN(cudaMemcpyAsync(stream->cpuOutputs, stream->gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
   CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
 
   return NULL;
 }
 
-const char* getResults_powm(streamData *stream) {
+const char* getResults(streamData *stream) {
   // Wait for download to complete
   CUDA_CHECK_RETURN(cudaEventSynchronize(stream->deviceToHost));
+  // Not sure if we can check the error report before this (e.g. in download function)
   CGBN_CHECK_RETURN(stream->report);
   return NULL;
 }
 
 typedef powm_params_t<32, 4096, 5> params4096;
 
-template<class params>
-inline const char* run_powm_export(streamData *stream) {
-  return run_powm<params>(stream);
-}
-
-template<class params>
-inline const char* upload_export(const uint32_t instance_count, streamData *stream) {
-  return upload_powm<params>(instance_count, stream);
-}
-
-template<class params>
-inline const char* download_powm_export(streamData *stream) {
-  return download_powm<params>(stream);
-}
-
-inline return_data* getResults_powm_export(streamData *stream) {
+inline return_data* getResults_export(streamData *stream) {
   return_data* result = (return_data*)malloc(sizeof(*result));
   result->result = stream->cpuOutputs;
-  result->error = getResults_powm(stream);
+  result->error = getResults(stream);
   return result;
 }
 
@@ -421,17 +422,20 @@ inline return_data* getResults_powm_export(streamData *stream) {
 // create a bunch of streams and buffers suitable for running a particular kernel
 inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
   stream->capacity = createInfo.capacity;
+  stream->constantsCapacity = createInfo.constantsCapacity;
+  stream->outputsCapacity = createInfo.outputsCapacity;
+  stream->inputsCapacity = createInfo.inputsCapacity;
   stream->length = 0;
   CUDA_CHECK_RETURN(cudaStreamCreate(&(stream->stream)));
-  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuInputs), createInfo.inputsSize));
-  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuOutputs), createInfo.outputsSize));
-  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuConstants), createInfo.constantsSize));
+  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuInputs), createInfo.inputsCapacity));
+  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuOutputs), createInfo.outputsCapacity));
+  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuConstants), createInfo.constantsCapacity));
   CUDA_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
-  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuOutputs), createInfo.outputsSize, cudaHostAllocDefault));
+  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuOutputs), createInfo.outputsCapacity, cudaHostAllocDefault));
 
   // Both of these next buffers should only be written on the host, so they can be allocated write-combined
-  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuInputs), createInfo.inputsSize, cudaHostAllocWriteCombined));
-  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuConstants), createInfo.constantsSize, cudaHostAllocWriteCombined));
+  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuInputs), createInfo.inputsCapacity, cudaHostAllocWriteCombined));
+  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuConstants), createInfo.constantsCapacity, cudaHostAllocWriteCombined));
 
   // These events are created with timing disabled because it takes time 
   // to get the timing data, and we don't need it.
@@ -499,21 +503,21 @@ inline const char* destroyStream(streamData *stream) {
 extern "C" {
   // Enqueue upload data for a powm kernel run for 4K bits
   // Stage input data by copying to the stream's constants and inputs memory before calling
-  const char* upload_powm_4096(const uint32_t instance_count, void *stream) {
-    return upload_export<params4096>(instance_count, (streamData*)stream);
+  const char* upload(const uint32_t instance_count, void *stream, size_t inputsUploadSize, size_t constantsUploadSize, size_t outputsDownloadSize) {
+    return upload(instance_count, (streamData*)stream, inputsUploadSize, constantsUploadSize, outputsDownloadSize);
   }
   
   // Run powm for 4K bits
-  const char* run_powm_4096(void *stream) {
-    return run_powm_export<params4096>((streamData*)stream);
+  const char* run(void *stream, kernel whichToRun) {
+    return run<params4096>((streamData*)stream, whichToRun);
   }
 
-  const char* download_powm_4096(void *stream) {
-    return download_powm_export<params4096>((streamData*)stream);
+  const char* download(void *stream) {
+    return download((streamData*)stream);
   }
 
-  struct return_data* getResults_powm(void *stream) {
-    return getResults_powm_export((streamData*)stream);
+  struct return_data* getResults(void *stream) {
+    return getResults_export((streamData*)stream);
   }
 
   // Call this when starting the program to allocate resources
@@ -542,18 +546,6 @@ extern "C" {
   const char* resetDevice() {
     CUDA_CHECK_RETURN(cudaDeviceReset());
     return NULL;
-  }
-
-  size_t getConstantsSize_powm4096() {
-    return powm_odd_t<params4096>::getConstantsSize();
-  }
-
-  size_t getInputsSize_powm4096(size_t length) {
-    return powm_odd_t<params4096>::getInputsSize(length);
-  }
-  
-  size_t getOutputsSize_powm4096(size_t length) {
-    return powm_odd_t<params4096>::getOutputsSize(length);
   }
 
   // Return cpu inputs buffer pointer for writing
