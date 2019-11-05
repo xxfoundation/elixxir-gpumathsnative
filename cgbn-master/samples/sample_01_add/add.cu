@@ -116,7 +116,7 @@ __global__ void kernel_add(cgbn_error_report_t *report, instance_t *instances, u
   cgbn_store(bn_env, &(instances[instance].sum), r);   // store r into sum
 }
 
-void floobleDoodle() {
+int main() {
   instance_t          *instances, *gpuInstances;
   cgbn_error_report_t *report;
   
