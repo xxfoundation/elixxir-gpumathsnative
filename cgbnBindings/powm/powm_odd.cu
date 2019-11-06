@@ -318,58 +318,6 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   cgbn_store(po._env, &(outputs[instance]), r);
 }
 
-// Enqueue a host-to-device transfer before a kernel run
-// Should work for any kernel that's compatible with streamData type
-const char* upload(const uint32_t instance_count, streamData* gpuData, size_t inputsUploadSize, size_t constantsUploadSize, size_t outputsDownloadSize) {
-#ifdef TRACE
-  printf("upload (streamData)\n");
-  printf("inputs uploadsize: %d, constantsUploadSize: %d, outputsDownloadSize: %d\n", inputsUploadSize, constantsUploadSize, outputsDownloadSize);
-#endif
-  // Previous download must finish before data are uploaded
-  CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
-  
-  // Set instance count; it's re-used when the kernel gets run later
-  gpuData->length = instance_count;
-  // If there are more instances uploaded than the stream can handle, that's an error
-  // At least for now
-  if (gpuData->length > gpuData->capacity) {
-    return strdup("upload_powm error: length greater than capacity\n");
-  }
-  // It also doesn't take too long to bounds check the requested data transfer sizes
-  // to avoid segmentation faults
-  if (gpuData->inputsCapacity < inputsUploadSize) {
-    return strdup("upload error: input upload size greater than capacity\n");
-  }
-  if (gpuData->constantsCapacity < constantsUploadSize) {
-    return strdup("upload error: constants upload size greater than capacity\n");
-  }
-  if (gpuData->outputsCapacity < outputsDownloadSize) {
-    return strdup("upload error: outputs download size greater than capacity\n");
-  }
-
-  // At this point, everything should be in a good state, so set the needed variables
-  gpuData->inputsLength = inputsUploadSize;
-  gpuData->outputsLength = outputsDownloadSize;
-  gpuData->constantsLength = constantsUploadSize;
-#ifdef TRACE
-  printf("inputsLength: %d, outputsLength: %d, constantsLength: %d\n", gpuData->inputsLength, gpuData->outputsLength, gpuData->constantsLength);
-#endif
-
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuInputs, gpuData->cpuInputs, gpuData->inputsLength,
-        cudaMemcpyHostToDevice, gpuData->stream));
-
-  // Currently, we're copying to the constants before each kernel launch
-  // This might not be necessary, but it's not that much data
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuConstants, gpuData->cpuConstants, gpuData->constantsLength,
-        cudaMemcpyHostToDevice, gpuData->stream));
-
-  // Run should wait on this event for kernel launch
-  // The event should include any memcpys that haven't completed yet
-  CUDA_CHECK_RETURN(cudaEventRecord(gpuData->hostToDevice, gpuData->stream));
-
-  return NULL;
-}
-
 // Run powm kernel
 // Enqueues kernel on the stream and returns immediately (non-blocking)
 // The results will be placed in the stream's gpu outputs buffer some time after the kernel launch
@@ -401,24 +349,6 @@ const char* run(streamData *stream, kernel whichToRun) {
   return NULL;
 }
 
-// Enqueue a download of the results after the kernel finishes running
-const char* download(streamData *stream) {
-#ifdef TRACE
-  printf("download (streamData)\n");
-  printf("output length: %d\n", stream->outputsLength);
-  printf("cpu output cap: %d\n", stream->outputsCapacity);
-#endif
-  // Wait for the kernel to finish running
-  CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
-
-  // The kernel ran successfully, so we get the results off the GPU
-  // This should cause invalid argument errors
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(stream->cpuOutputs, stream->gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
-  CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
-
-  return NULL;
-}
-
 const char* getResults(streamData *stream) {
 #ifdef TRACE
   printf("getResults (streamData)\n");
@@ -431,17 +361,6 @@ const char* getResults(streamData *stream) {
 }
 
 typedef powm_params_t<32, 4096, 5> params4096;
-
-inline return_data* getResults_export(streamData *stream) {
-#ifdef TRACE
-  printf("getResults_export\n");
-#endif
-  return_data* result = (return_data*)malloc(sizeof(*result));
-  result->result = stream->cpuOutputs;
-  result->error = getResults(stream);
-  return result;
-}
-
 
 // create a bunch of streams and buffers suitable for running a particular kernel
 inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
@@ -477,62 +396,6 @@ inline const char* createStream(streamCreateInfo createInfo, streamData* stream)
   return NULL;
 }
 
-// allocate the data necessary to return a stream manager with an error across the bindings
-return_data* createStream_export(streamCreateInfo createInfo) {
-#ifdef TRACE
-  printf("createStream_export\n");
-#endif
-  return_data* result = (return_data*)malloc(sizeof(*result));
-  streamData *s = (streamData*)(malloc(sizeof(*s)));
-  result->error = createStream(createInfo, s);
-  result->result = s;
-  return result;
-}
-
-// free a stream
-inline const char* destroyStream(streamData *stream) {
-#ifdef TRACE
-  printf("destroyStream (streamData)\n");
-#endif
-  // Don't know at what point there could have been errors while creating this stream,
-  // so make sure things exist before destroying them
-  if (stream != NULL) {
-    if (stream->gpuInputs != NULL) {
-      CUDA_CHECK_RETURN(cudaFree(stream->gpuInputs));
-    }
-    if (stream->gpuOutputs != NULL) {
-      CUDA_CHECK_RETURN(cudaFree(stream->gpuOutputs));
-    }
-    if (stream->gpuConstants != NULL) {
-      CUDA_CHECK_RETURN(cudaFree(stream->gpuConstants));
-    }
-    if (stream->cpuInputs != NULL) {
-      CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuInputs));
-    }
-    if (stream->cpuOutputs != NULL) {
-      CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuOutputs));
-    }
-    if (stream->cpuConstants != NULL) {
-      CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuConstants));
-    }
-    if (stream->report != NULL) {
-      CUDA_CHECK_RETURN(cgbn_error_report_free(stream->report));
-    }
-    if (stream->hostToDevice != NULL) {
-      CUDA_CHECK_RETURN(cudaEventDestroy(stream->hostToDevice));
-    }
-    if (stream->exec != NULL) {
-      CUDA_CHECK_RETURN(cudaEventDestroy(stream->exec));
-    }
-    if (stream->deviceToHost != NULL) {
-      CUDA_CHECK_RETURN(cudaEventDestroy(stream->deviceToHost));
-    }
-    free((void*)stream);
-  }
-
-  return NULL;
-}
-
 // All the methods used in cgo should have extern "C" linkage to avoid
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
@@ -543,7 +406,47 @@ extern "C" {
 #ifdef TRACE
     printf("upload (void)\n");
 #endif
-    return upload(instance_count, (streamData*)stream, inputsUploadSize, constantsUploadSize, outputsDownloadSize);
+    auto gpuData = (streamData*)stream;
+    // Previous download must finish before data are uploaded
+    CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
+    
+    // Set instance count; it's re-used when the kernel gets run later
+    gpuData->length = instance_count;
+    // If there are more instances uploaded than the stream can handle, that's an error
+    // At least for now
+    if (gpuData->length > gpuData->capacity) {
+      return strdup("upload_powm error: length greater than capacity\n");
+    }
+    // It also doesn't take too long to bounds check the requested data transfer sizes
+    // to avoid segmentation faults
+    if (gpuData->inputsCapacity < inputsUploadSize) {
+      return strdup("upload error: input upload size greater than capacity\n");
+    }
+    if (gpuData->constantsCapacity < constantsUploadSize) {
+      return strdup("upload error: constants upload size greater than capacity\n");
+    }
+    if (gpuData->outputsCapacity < outputsDownloadSize) {
+      return strdup("upload error: outputs download size greater than capacity\n");
+    }
+
+    // At this point, everything should be in a good state, so set the needed variables
+    gpuData->inputsLength = inputsUploadSize;
+    gpuData->outputsLength = outputsDownloadSize;
+    gpuData->constantsLength = constantsUploadSize;
+
+    CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuInputs, gpuData->cpuInputs, gpuData->inputsLength,
+          cudaMemcpyHostToDevice, gpuData->stream));
+
+    // Currently, we're copying to the constants before each kernel launch
+    // This might not be necessary, but it's not that much data
+    CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuConstants, gpuData->cpuConstants, gpuData->constantsLength,
+          cudaMemcpyHostToDevice, gpuData->stream));
+
+    // Run should wait on this event for kernel launch
+    // The event should include any memcpys that haven't completed yet
+    CUDA_CHECK_RETURN(cudaEventRecord(gpuData->hostToDevice, gpuData->stream));
+
+    return NULL;
   }
   
   // Run powm for 4K bits
@@ -554,27 +457,43 @@ extern "C" {
     return run<params4096>((streamData*)stream, whichToRun);
   }
 
-  const char* download(void *stream) {
+  const char* download(void *s) {
 #ifdef TRACE
     printf("download (void)\n");
 #endif
-    return download((streamData*)stream);
+    auto stream = (streamData*)s;
+    // Wait for the kernel to finish running
+    CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
+
+    // The kernel ran successfully, so we get the results off the GPU
+    // This should cause invalid argument errors
+    CUDA_CHECK_RETURN(cudaMemcpyAsync(stream->cpuOutputs, stream->gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
+    CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
+
+    return NULL;
   }
 
   struct return_data* getResults(void *stream) {
 #ifdef TRACE
     printf("getResults (void)\n");
 #endif
-    return getResults_export((streamData*)stream);
+    return_data* result = (return_data*)malloc(sizeof(*result));
+    result->result = ((streamData*)stream)->cpuOutputs;
+    result->error = getResults((streamData*)stream);
+    return result;
   }
 
   // Call this when starting the program to allocate resources
-  // Returns pointer to class and error
+  // Returns stream or error
   struct return_data* createStream(streamCreateInfo createInfo) {
 #ifdef TRACE
     printf("createStream (streamCreateInfo)\n");
 #endif
-    return createStream_export(createInfo);
+    return_data* result = (return_data*)malloc(sizeof(*result));
+    streamData *s = (streamData*)(malloc(sizeof(*s)));
+    result->error = createStream(createInfo, s);
+    result->result = s;
+    return result;
   }
 
   // Call this after execution has completed to deallocate resources
@@ -583,7 +502,44 @@ extern "C" {
 #ifdef TRACE
     printf("destroyStream (void)\n");
 #endif
-    return destroyStream((streamData*)(destroyee));
+    auto stream = (streamData*)destroyee;
+    // Don't know at what point there could have been errors while creating this stream,
+    // so make sure things exist before destroying them
+    if (stream != NULL) {
+      if (stream->gpuInputs != NULL) {
+        CUDA_CHECK_RETURN(cudaFree(stream->gpuInputs));
+      }
+      if (stream->gpuOutputs != NULL) {
+        CUDA_CHECK_RETURN(cudaFree(stream->gpuOutputs));
+      }
+      if (stream->gpuConstants != NULL) {
+        CUDA_CHECK_RETURN(cudaFree(stream->gpuConstants));
+      }
+      if (stream->cpuInputs != NULL) {
+        CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuInputs));
+      }
+      if (stream->cpuOutputs != NULL) {
+        CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuOutputs));
+      }
+      if (stream->cpuConstants != NULL) {
+        CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuConstants));
+      }
+      if (stream->report != NULL) {
+        CUDA_CHECK_RETURN(cgbn_error_report_free(stream->report));
+      }
+      if (stream->hostToDevice != NULL) {
+        CUDA_CHECK_RETURN(cudaEventDestroy(stream->hostToDevice));
+      }
+      if (stream->exec != NULL) {
+        CUDA_CHECK_RETURN(cudaEventDestroy(stream->exec));
+      }
+      if (stream->deviceToHost != NULL) {
+        CUDA_CHECK_RETURN(cudaEventDestroy(stream->deviceToHost));
+      }
+      free((void*)stream);
+    }
+
+    return NULL;
   }
 
   // Call this after execution has completed to write out profile information to the disk
@@ -604,20 +560,17 @@ extern "C" {
 
   // Return cpu inputs buffer pointer for writing
   void* getCpuInputs(void* stream) {
-    streamData *gpuData = (streamData*)(stream);
-    return gpuData->cpuInputs;
+    return ((streamData*)stream)->cpuInputs;
   }
 
   // Return cpu outputs buffer pointer for reading
   void* getCpuOutputs(void* stream) {
-    streamData *gpuData = (streamData*)(stream);
-    return gpuData->cpuOutputs;
+    return ((streamData*)stream)->cpuOutputs;
   }
 
   // Return cpu constants buffer pointer for writing
   void* getCpuConstants(void* stream) {
-    streamData *gpuData = (streamData*)(stream);
-    return gpuData->cpuConstants;
+    return ((streamData*)stream)->cpuConstants;
   }
 }
 
