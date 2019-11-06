@@ -32,6 +32,8 @@ IN THE SOFTWARE.
 #include "../utility/support.h"
 #include "powm_odd_export.h"
 
+#define TRACE
+
 // Stream object and associated data for a stream
 // This name could perhaps be better...
 struct streamData {
@@ -319,6 +321,10 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
 // Enqueue a host-to-device transfer before a kernel run
 // Should work for any kernel that's compatible with streamData type
 const char* upload(const uint32_t instance_count, streamData* gpuData, size_t inputsUploadSize, size_t constantsUploadSize, size_t outputsDownloadSize) {
+#ifdef TRACE
+  printf("upload (streamData)\n");
+  printf("inputs uploadsize: %d, constantsUploadSize: %d, outputsDownloadSize: %d\n", inputsUploadSize, constantsUploadSize, outputsDownloadSize);
+#endif
   // Previous download must finish before data are uploaded
   CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
   
@@ -345,6 +351,9 @@ const char* upload(const uint32_t instance_count, streamData* gpuData, size_t in
   gpuData->inputsLength = inputsUploadSize;
   gpuData->outputsLength = outputsDownloadSize;
   gpuData->constantsLength = constantsUploadSize;
+#ifdef TRACE
+  printf("inputsLength: %d, outputsLength: %d, constantsLength: %d\n", gpuData->inputsLength, gpuData->outputsLength, gpuData->constantsLength);
+#endif
 
   CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuInputs, gpuData->cpuInputs, gpuData->inputsLength,
         cudaMemcpyHostToDevice, gpuData->stream));
@@ -367,6 +376,9 @@ const char* upload(const uint32_t instance_count, streamData* gpuData, size_t in
 // Precondition: stream should have had upload called on it
 template<class params>
 const char* run(streamData *stream, kernel whichToRun) {
+#ifdef TRACE
+  printf("run (streamData)\n");
+#endif
   const int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
 
@@ -391,10 +403,16 @@ const char* run(streamData *stream, kernel whichToRun) {
 
 // Enqueue a download of the results after the kernel finishes running
 const char* download(streamData *stream) {
+#ifdef TRACE
+  printf("download (streamData)\n");
+  printf("output length: %d\n", stream->outputsLength);
+  printf("cpu output cap: %d\n", stream->outputsCapacity);
+#endif
   // Wait for the kernel to finish running
   CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
 
   // The kernel ran successfully, so we get the results off the GPU
+  // This should cause invalid argument errors
   CUDA_CHECK_RETURN(cudaMemcpyAsync(stream->cpuOutputs, stream->gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
   CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
 
@@ -402,6 +420,9 @@ const char* download(streamData *stream) {
 }
 
 const char* getResults(streamData *stream) {
+#ifdef TRACE
+  printf("getResults (streamData)\n");
+#endif
   // Wait for download to complete
   CUDA_CHECK_RETURN(cudaEventSynchronize(stream->deviceToHost));
   // Not sure if we can check the error report before this (e.g. in download function)
@@ -412,6 +433,9 @@ const char* getResults(streamData *stream) {
 typedef powm_params_t<32, 4096, 5> params4096;
 
 inline return_data* getResults_export(streamData *stream) {
+#ifdef TRACE
+  printf("getResults_export\n");
+#endif
   return_data* result = (return_data*)malloc(sizeof(*result));
   result->result = stream->cpuOutputs;
   result->error = getResults(stream);
@@ -421,11 +445,17 @@ inline return_data* getResults_export(streamData *stream) {
 
 // create a bunch of streams and buffers suitable for running a particular kernel
 inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
+#ifdef TRACE
+  printf("createStream (streamData)\n");
+#endif
   stream->capacity = createInfo.capacity;
   stream->constantsCapacity = createInfo.constantsCapacity;
   stream->outputsCapacity = createInfo.outputsCapacity;
   stream->inputsCapacity = createInfo.inputsCapacity;
   stream->length = 0;
+  stream->constantsLength = 0;
+  stream->outputsLength = 0;
+  stream->inputsLength = 0;
   CUDA_CHECK_RETURN(cudaStreamCreate(&(stream->stream)));
   CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuInputs), createInfo.inputsCapacity));
   CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuOutputs), createInfo.outputsCapacity));
@@ -449,6 +479,9 @@ inline const char* createStream(streamCreateInfo createInfo, streamData* stream)
 
 // allocate the data necessary to return a stream manager with an error across the bindings
 return_data* createStream_export(streamCreateInfo createInfo) {
+#ifdef TRACE
+  printf("createStream_export\n");
+#endif
   return_data* result = (return_data*)malloc(sizeof(*result));
   streamData *s = (streamData*)(malloc(sizeof(*s)));
   result->error = createStream(createInfo, s);
@@ -458,6 +491,9 @@ return_data* createStream_export(streamCreateInfo createInfo) {
 
 // free a stream
 inline const char* destroyStream(streamData *stream) {
+#ifdef TRACE
+  printf("destroyStream (streamData)\n");
+#endif
   // Don't know at what point there could have been errors while creating this stream,
   // so make sure things exist before destroying them
   if (stream != NULL) {
@@ -504,31 +540,49 @@ extern "C" {
   // Enqueue upload data for a powm kernel run for 4K bits
   // Stage input data by copying to the stream's constants and inputs memory before calling
   const char* upload(const uint32_t instance_count, void *stream, size_t inputsUploadSize, size_t constantsUploadSize, size_t outputsDownloadSize) {
+#ifdef TRACE
+    printf("upload (void)\n");
+#endif
     return upload(instance_count, (streamData*)stream, inputsUploadSize, constantsUploadSize, outputsDownloadSize);
   }
   
   // Run powm for 4K bits
   const char* run(void *stream, kernel whichToRun) {
+#ifdef TRACE
+    printf("run (void)\n");
+#endif
     return run<params4096>((streamData*)stream, whichToRun);
   }
 
   const char* download(void *stream) {
+#ifdef TRACE
+    printf("download (void)\n");
+#endif
     return download((streamData*)stream);
   }
 
   struct return_data* getResults(void *stream) {
+#ifdef TRACE
+    printf("getResults (void)\n");
+#endif
     return getResults_export((streamData*)stream);
   }
 
   // Call this when starting the program to allocate resources
   // Returns pointer to class and error
   struct return_data* createStream(streamCreateInfo createInfo) {
+#ifdef TRACE
+    printf("createStream (streamCreateInfo)\n");
+#endif
     return createStream_export(createInfo);
   }
 
   // Call this after execution has completed to deallocate resources
   // Returns error
   const char* destroyStream(void *destroyee) {
+#ifdef TRACE
+    printf("destroyStream (void)\n");
+#endif
     return destroyStream((streamData*)(destroyee));
   }
 
