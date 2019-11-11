@@ -115,22 +115,40 @@ class powm_params_t {
 };
 
 template<class params>
-class powm_odd_t {
+class cmixPrecomp {
   public:
   static const uint32_t window_bits=params::WINDOW_BITS;  // used a lot, give it an instance variable
 
-  // It might be possible to switch to a SOA structure within the instance_t struct
-  // Currently, I believe removing this struct completely would make things worse
-  // The main advantage of the current interleaved AOS input structure is that it allows making the 
-  // input memory longer by concatenating byte arrays that represent valid inputs
-  // I also need to run benchmarks on an x16 pcie link to make sure we're making the correct pcie bandwidth tradeoff
-  // Results shouldn't belong in the instance struct. They should get allocated and written separately, so as to not
-  // have to download and uploaded more than is necessary. x and pow should only be uploaded, and results should only
-  // be downloaded.
+  typedef cgbn_mem_t<params::BITS> mem_t;
+
   typedef struct {
-    cgbn_mem_t<params::BITS> x;
-    cgbn_mem_t<params::BITS> power;
-  } input_t;
+    mem_t x;
+    mem_t power;
+  } powm_odd_input_t;
+
+  typedef struct {
+    // Used to calculate both outputs
+    mem_t privateKey;
+
+    // Used to calculate ecrKeys output
+    mem_t ecrKeys;
+    mem_t key;
+
+    // Used to calculate cypher output
+    mem_t publicCypherKey;
+    mem_t cypher;
+  } elgamal_input_t;
+
+  typedef struct {
+    mem_t ecrKeys;
+    mem_t cypher;
+  } elgamal_output_t;
+
+  typedef struct {
+    mem_t g;
+    mem_t prime;
+  } elgamal_constant_t;
+
   
   typedef cgbn_context_t<params::TPI, params>   context_t;
   typedef cgbn_env_t<context_t, params::BITS>   env_t;
@@ -140,14 +158,15 @@ class powm_odd_t {
   context_t _context;
   env_t     _env;
 
-  __device__ __forceinline__ powm_odd_t(cgbn_monitor_t monitor, cgbn_error_report_t *report, int32_t instance) : _context(monitor, report, (uint32_t)instance), _env(_context) {
+  __device__ __forceinline__ cmixPrecomp(cgbn_monitor_t monitor, cgbn_error_report_t *report, int32_t instance) : _context(monitor, report, (uint32_t)instance), _env(_context) {
   }
 
-  __device__ __forceinline__ void fixed_window_powm_odd(bn_t &result, const bn_t &x, const bn_t &power, const bn_t &modulus) {
+  // Precondition: x is in montgomery space corresponding to modulus
+  // Doesn't convert into or out of montgomery space, as I'm trying to decouple the exponentiations and multiplications from the montgomery conversions
+  __device__ __forceinline__ void fixed_window_powm_odd(bn_t &result, const bn_t &x, const bn_t &power, const bn_t &modulus, uint32_t np0) {
     bn_t       t;
     bn_local_t window[1<<window_bits];
     int32_t    index, position, offset;
-    uint32_t   np0;
 
     // conmpute x^power mod modulus, using the fixed window algorithm
     // requires:  x<modulus,  modulus is odd
@@ -156,8 +175,8 @@ class powm_odd_t {
     cgbn_negate(_env, t, modulus);
     cgbn_store(_env, window+0, t);
     
-    // convert x into Montgomery space, store into window table
-    np0=cgbn_bn2mont(_env, result, x, modulus);
+    // store x into window table
+    cgbn_set(_env, result, x);
     cgbn_store(_env, window+1, result);
     cgbn_set(_env, t, result);
     
@@ -195,10 +214,10 @@ class powm_odd_t {
       cgbn_mont_mul(_env, result, result, t, modulus, np0);
     }
     
-    // we've processed the exponent now, convert back to normal space
-    cgbn_mont2bn(_env, result, result, modulus, np0);
+    // we've processed the exponent now, and at some point it will need to be converted to normal space again
   }
   
+  // Precondition: Inputs are not transformed to Montgomery space
   __device__ __forceinline__ void sliding_window_powm_odd(bn_t &result, const bn_t &x, const bn_t &power, const bn_t &modulus) {
     bn_t         t, starts;
     int32_t      index, position, leading;
@@ -268,30 +287,14 @@ class powm_odd_t {
       cgbn_set_ui32(_env, result, 1);
     }
   }
-
-  // Convenience methods to calculate required size for inputs, outputs, and constants
-  __host__ static inline size_t getInputsSize(size_t length) {
-    // Each input is the size of an instance
-    return sizeof(input_t) * length;
-  }
-
-  __host__ static inline size_t getOutputsSize(size_t length) {
-    // There's only one number in each output
-    return sizeof(cgbn_mem_t<params::BITS>) * length;
-  }
-
-  __host__ static inline size_t getConstantsSize() {
-    // There's one constant, the modulus
-    return sizeof(cgbn_mem_t<params::BITS>);
-  }
 };
 
 // kernel implementation using cgbn
 // 
-// Unfortunately, the kernel must be separate from the powm_odd_t class
+// Unfortunately, the kernel must be separate from the cmixPrecomp class
 // kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 template<class params>
-__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t<params>::input_t *inputs, cgbn_mem_t<params::BITS> *modulus, cgbn_mem_t<params::BITS> *outputs, size_t count) {
+__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename cmixPrecomp<params>::powm_odd_input_t *inputs, cgbn_mem_t<params::BITS> *modulus, cgbn_mem_t<params::BITS> *outputs, size_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -299,8 +302,8 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   if(instance>=count)
     return;
 
-  powm_odd_t<params>                 po(cgbn_report_monitor, report, instance);
-  typename powm_odd_t<params>::bn_t  r, x, p, m;
+  cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
+  typename cmixPrecomp<params>::bn_t  r, x, p, m;
   
   // the loads and stores can go in the class, but it seems more natural to have them
   // here and to pass in and out bignums
@@ -310,11 +313,50 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
   
   // this can be either fixed_window_powm_odd or sliding_window_powm_odd.
   // when TPI<32, fixed window runs much faster because it is less divergent, so we use it here
-  po.fixed_window_powm_odd(r, x, p, m);
+  uint32_t np0 = cgbn_bn2mont(po._env, x, x, m);
+  po.fixed_window_powm_odd(r, x, p, m, np0);
+  cgbn_mont2bn(po._env, r, r, m, np0);
   //   OR
   // po.sliding_window_powm_odd(r, x, p, m);
   
   cgbn_store(po._env, &(outputs[instance]), r);
+}
+
+template<class params>
+__global__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp<params>::elgamal_input_t *inputs, typename cmixPrecomp<params>::elgamal_constant_t *constants, typename cmixPrecomp<params>::elgamal_output_t *outputs, size_t count) {
+  int32_t instance;
+
+  // decode an instance number from the blockIdx and threadIdx
+  instance=(blockIdx.x*blockDim.x + threadIdx.x)/params::TPI;
+  if(instance>=count)
+    return;
+
+  cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
+  typename cmixPrecomp<params>::bn_t privateKey, ecrKeys, key, publicCypherKey, cypher, g, prime, r;
+
+  // Prepare elgamal inputs
+  cgbn_load(po._env, privateKey, &(inputs[instance].privateKey));
+  cgbn_load(po._env, ecrKeys, &(inputs[instance].ecrKeys));
+  cgbn_load(po._env, key, &(inputs[instance].key));
+  cgbn_load(po._env, publicCypherKey, &(inputs[instance].publicCypherKey));
+  cgbn_load(po._env, cypher, &(inputs[instance].cypher));
+  cgbn_load(po._env, g, &(constants->g));
+  cgbn_load(po._env, prime, &(constants->prime));
+
+  // Calculate ecrKeys first
+  uint32_t np0 = cgbn_bn2mont(po._env, g, g, prime);
+  po.fixed_window_powm_odd(r, g, privateKey, prime, np0);
+  cgbn_mont_mul(po._env, r, r, key, prime, np0);
+  cgbn_mont_mul(po._env, r, r, ecrKeys, prime, np0);
+  cgbn_mont2bn(po._env, ecrKeys, r, prime, np0);
+  cgbn_store(po._env, &(outputs[instance].ecrKeys), ecrKeys);
+
+  // Calculate publicCypherKey second
+  np0 = cgbn_bn2mont(po._env, publicCypherKey, publicCypherKey, prime);
+  po.fixed_window_powm_odd(r, publicCypherKey, privateKey, prime, np0);
+  cgbn_mont_mul(po._env, r, r, cypher, prime, np0);
+  cgbn_mont2bn(po._env, cypher, r, prime, np0);
+  cgbn_store(po._env, &(outputs[instance].cypher), cypher);
 }
 
 // Run powm kernel
@@ -324,7 +366,7 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename powm_odd_t
 template<class params>
 const char* run(streamData *stream, kernel whichToRun) {
 #ifdef TRACE
-  printf("run (streamData)\n");
+  printf("run (streamData, kernel)\n");
 #endif
   const int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
@@ -333,15 +375,34 @@ const char* run(streamData *stream, kernel whichToRun) {
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
   // TODO We should be able to launch more than just this kernel.
   //  Organize with enumeration? Is it possible to use templates to make this better?
-  typedef typename powm_odd_t<params>::input_t input_t;
-  typedef cgbn_mem_t<params::BITS> num_t;
+  typedef cgbn_mem_t<params::BITS> mem_t;
 
-  kernel_powm_odd<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
-    stream->report, 
-    (input_t*)stream->gpuInputs, 
-    (num_t*)stream->gpuConstants, 
-    (num_t*)stream->gpuOutputs, 
-    stream->length);
+  switch (whichToRun) {
+  case KERNEL_POWM_ODD:
+    {
+      typedef typename cmixPrecomp<params>::powm_odd_input_t input_t;
+      kernel_powm_odd<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
+        stream->report, 
+        (input_t*)stream->gpuInputs, 
+        (mem_t*)stream->gpuConstants, 
+        (mem_t*)stream->gpuOutputs, 
+        stream->length);
+    }
+    break;
+  case KERNEL_ELGAMAL:
+    {
+      typedef typename cmixPrecomp<params>::elgamal_input_t input_t;
+      typedef typename cmixPrecomp<params>::elgamal_output_t output_t;
+      typedef typename cmixPrecomp<params>::elgamal_constant_t constant_t;
+      kernel_elgamal<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
+        stream->report, 
+        (input_t*)stream->gpuInputs, 
+        (constant_t*)stream->gpuConstants, 
+        (output_t*)stream->gpuOutputs, 
+        stream->length);
+    }
+    break;
+  }
 
   CUDA_CHECK_RETURN(cudaEventRecord(stream->exec, stream->stream));
 
