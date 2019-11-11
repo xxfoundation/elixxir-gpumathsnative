@@ -402,6 +402,12 @@ const char* run(streamData *stream, kernel whichToRun) {
         stream->length);
     }
     break;
+  case KERNEL_MUL2:
+    return strdup("KERNEL_MUL2 unimplemented");
+    break;
+  default:
+    return strdup("Unknown kernel not implemented");
+    break;
   }
 
   CUDA_CHECK_RETURN(cudaEventRecord(stream->exec, stream->stream));
