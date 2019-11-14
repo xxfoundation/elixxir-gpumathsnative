@@ -127,16 +127,9 @@ class cmixPrecomp {
   } powm_odd_input_t;
 
   typedef struct {
-    // Used to calculate both outputs
-    mem_t privateKey;
-
-    // Used to calculate ecrKeys output
-    mem_t ecrKeys;
-    mem_t key;
-
-    // Used to calculate cypher output
-    mem_t publicCypherKey;
-    mem_t cypher;
+    mem_t privateKey; // Used to calculate both outputs 
+    mem_t key; // Used to calculate ecrKeys output 
+    mem_t publicCypherKey; // Used to calculate cypher output
   } elgamal_input_t;
 
   typedef struct {
@@ -332,30 +325,29 @@ __global__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp
     return;
 
   cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
-  typename cmixPrecomp<params>::bn_t privateKey, ecrKeys, key, publicCypherKey, cypher, g, prime, r;
+  typename cmixPrecomp<params>::bn_t privateKey, ecrKeys, key, publicCypherKey, cypher, g, prime;
 
   // Prepare elgamal inputs
   cgbn_load(po._env, privateKey, &(inputs[instance].privateKey));
-  cgbn_load(po._env, ecrKeys, &(inputs[instance].ecrKeys));
   cgbn_load(po._env, key, &(inputs[instance].key));
   cgbn_load(po._env, publicCypherKey, &(inputs[instance].publicCypherKey));
-  cgbn_load(po._env, cypher, &(inputs[instance].cypher));
   cgbn_load(po._env, g, &(constants->g));
   cgbn_load(po._env, prime, &(constants->prime));
 
   // Calculate ecrKeys first
   uint32_t np0 = cgbn_bn2mont(po._env, g, g, prime);
-  po.fixed_window_powm_odd(r, g, privateKey, prime, np0);
-  cgbn_mont_mul(po._env, r, r, key, prime, np0);
-  cgbn_mont_mul(po._env, r, r, ecrKeys, prime, np0);
-  cgbn_mont2bn(po._env, ecrKeys, r, prime, np0);
-  cgbn_store(po._env, &(outputs[instance].ecrKeys), ecrKeys);
+  po.fixed_window_powm_odd(ecrKeys, g, privateKey, prime, np0);
+  cgbn_bn2mont(po._env, key, key, prime);
+  cgbn_mont_mul(po._env, ecrKeys, ecrKeys, key, prime, np0);
+  cgbn_mont2bn(po._env, ecrKeys, ecrKeys, prime, np0);
 
   // Calculate publicCypherKey second
-  np0 = cgbn_bn2mont(po._env, publicCypherKey, publicCypherKey, prime);
-  po.fixed_window_powm_odd(r, publicCypherKey, privateKey, prime, np0);
-  cgbn_mont_mul(po._env, r, r, cypher, prime, np0);
-  cgbn_mont2bn(po._env, cypher, r, prime, np0);
+  cgbn_bn2mont(po._env, publicCypherKey, publicCypherKey, prime);
+  po.fixed_window_powm_odd(cypher, publicCypherKey, privateKey, prime, np0);
+  cgbn_mont2bn(po._env, cypher, cypher, prime, np0);
+
+  // Store outputs in the outputs area
+  cgbn_store(po._env, &(outputs[instance].ecrKeys), ecrKeys);
   cgbn_store(po._env, &(outputs[instance].cypher), cypher);
 }
 
@@ -532,7 +524,6 @@ extern "C" {
     CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
 
     // The kernel ran successfully, so we get the results off the GPU
-    // This should cause invalid argument errors
     CUDA_CHECK_RETURN(cudaMemcpyAsync(stream->cpuOutputs, stream->gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
     CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
 
