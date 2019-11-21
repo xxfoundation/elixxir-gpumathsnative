@@ -26,29 +26,32 @@ struct return_data {
   const char *error;
 };
 
-// Upload data for a powm kernel run for 4K bits
-const char* upload_powm_4096(const uint32_t instance_count, void *stream);
-// Run powm for 4K bits
-const char* run_powm_4096(void *stream);
-// Enqueue download from a previous kernel launch
-const char* download_powm_4096(void *stream);
-// Wait for a results download to finish
-struct return_data* getResults_powm(void *stream);
+enum kernel {
+  KERNEL_POWM_ODD,
+  KERNEL_ELGAMAL,
+  KERNEL_MUL2,
+};
 
-// These methods query the amount of memory necessary for the GPU buffers from the class
-size_t getConstantsSize_powm4096();
-size_t getInputsSize_powm4096(size_t length);
-size_t getOutputsSize_powm4096(size_t length);
+// Prepare a kernel run
+const char* upload(const uint32_t instance_count, void *stream, size_t inputsUploadSize, size_t constantsUploadSize, size_t outputsDownloadSize);
+// Enqueue a kernel run
+const char* run(void *stream, enum kernel whichToRun);
+// Enqueue download from a previous kernel launch
+const char* download(void *stream);
+// Wait for a results download to finish
+struct return_data* getResults(void *stream);
 
 struct streamCreateInfo {
   // How many instances can be invoked in a kernel launch?
   size_t capacity;
   // What's the size in bytes of the entire input buffer?
-  size_t inputsSize;
+  // (assumed to be linear in size with number of inputs)
+  size_t inputsCapacity;
   // What's the size in bytes of the entire output buffer?
-  size_t outputsSize;
+  // (assumed to be linear in size with number of inputs)
+  size_t outputsCapacity;
   // What's the size in bytes of the entire constants buffer?
-  size_t constantsSize;
+  size_t constantsCapacity;
 };
 
 
