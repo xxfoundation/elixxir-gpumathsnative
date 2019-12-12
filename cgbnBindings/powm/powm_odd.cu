@@ -32,7 +32,7 @@ IN THE SOFTWARE.
 #include "../utility/support.h"
 #include "powm_odd_export.h"
 
-#define TRACE
+//#define TRACE
 
 // Stream object and associated data for a stream
 // This name could perhaps be better...
@@ -129,7 +129,8 @@ class cmixPrecomp {
   typedef struct {
     mem_t privateKey; // Used to calculate both outputs 
     mem_t key; // Used to calculate ecrKeys output 
-    mem_t publicCypherKey; // Used to calculate cypher output
+    mem_t ecrKeys; // Used to calculate ecrKeys output
+    mem_t cypher; // Used to calculate cypher output
   } elgamal_input_t;
 
   typedef struct {
@@ -140,6 +141,7 @@ class cmixPrecomp {
   typedef struct {
     mem_t g;
     mem_t prime;
+    mem_t publicCypherKey;
   } elgamal_constant_t;
 
   
@@ -325,30 +327,41 @@ __global__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp
     return;
 
   cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
-  typename cmixPrecomp<params>::bn_t privateKey, ecrKeys, key, publicCypherKey, cypher, g, prime;
+  typename cmixPrecomp<params>::bn_t privateKey, ecrKeys, key, publicCypherKey, cypher, g, prime, result;
 
   // Prepare elgamal inputs
   cgbn_load(po._env, privateKey, &(inputs[instance].privateKey));
   cgbn_load(po._env, key, &(inputs[instance].key));
-  cgbn_load(po._env, publicCypherKey, &(inputs[instance].publicCypherKey));
+  cgbn_load(po._env, publicCypherKey, &(constants->publicCypherKey));
+  cgbn_load(po._env, ecrKeys, &(inputs[instance].ecrKeys));
+  cgbn_load(po._env, cypher, &(inputs[instance].cypher));
   cgbn_load(po._env, g, &(constants->g));
   cgbn_load(po._env, prime, &(constants->prime));
+  // TODO load/calculate np0 if not montgomery converting
+  // It's also possible to always convert g and publicCypherKey to mont space before uploading!
+  // This would save a little time to not convert them all the time. But it requires making mont
+  // conversion routines on CPU. Not sure if golang big int library can do that. If not it would
+  // be straightforward to write. But you'd get g, publicCypherKey, and np0 ready 
+  // on all instances for cheap.
 
   // Calculate ecrKeys first
+  // TODO experiment with the ordering of the calls here. It may be possible to gain some speed by rearranging things
   uint32_t np0 = cgbn_bn2mont(po._env, g, g, prime);
-  po.fixed_window_powm_odd(ecrKeys, g, privateKey, prime, np0);
+  po.fixed_window_powm_odd(result, g, privateKey, prime, np0);
   cgbn_bn2mont(po._env, key, key, prime);
-  cgbn_mont_mul(po._env, ecrKeys, ecrKeys, key, prime, np0);
-  cgbn_mont2bn(po._env, ecrKeys, ecrKeys, prime, np0);
+  cgbn_mont_mul(po._env, result, result, key, prime, np0);
+  cgbn_bn2mont(po._env, ecrKeys, ecrKeys, prime);
+  cgbn_mont_mul(po._env, result, result, ecrKeys, prime, np0);
+  cgbn_mont2bn(po._env, result, result, prime, np0);
+  cgbn_store(po._env, &(outputs[instance].ecrKeys), result);
 
-  // Calculate publicCypherKey second
+  // Calculate cypher second
   cgbn_bn2mont(po._env, publicCypherKey, publicCypherKey, prime);
-  po.fixed_window_powm_odd(cypher, publicCypherKey, privateKey, prime, np0);
-  cgbn_mont2bn(po._env, cypher, cypher, prime, np0);
-
-  // Store outputs in the outputs area
-  cgbn_store(po._env, &(outputs[instance].ecrKeys), ecrKeys);
-  cgbn_store(po._env, &(outputs[instance].cypher), cypher);
+  po.fixed_window_powm_odd(result, publicCypherKey, privateKey, prime, np0);
+  cgbn_bn2mont(po._env, cypher, cypher, prime);
+  cgbn_mont_mul(po._env, result, result, cypher, prime, np0);
+  cgbn_mont2bn(po._env, result, result, prime, np0);
+  cgbn_store(po._env, &(outputs[instance].cypher), result);
 }
 
 // Run powm kernel
