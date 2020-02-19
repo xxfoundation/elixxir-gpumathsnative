@@ -18,10 +18,15 @@ pick:
 	@echo
 
 clean:
-	rm -f libpowmosm*.so
+	rm -f libpowmo*.so
+
+devinstall:
+	mkdir -p ../../lib
+	mv libpowmo*.so ../../lib
 
 install:
-	mv libpowmosm*.so ../../lib
+	mkdir -p /opt/elixxir/lib
+	mv libpowmo*.so /opt/elixxir/lib
 
 kepler:
 	nvcc --compiler-options '-fPIC' --shared $(INC) $(LIB) -I../../cgbn-master/include -arch=sm_30 powm_odd.cu -o libpowmosm40.so -lgmp
@@ -36,6 +41,8 @@ volta:
 	nvcc --compiler-options '-fPIC' --shared $(INC) $(LIB) -I../../cgbn-master/include -arch=sm_70 powm_odd.cu -o libpowmosm70.so -lgmp
 
 turing: 
-	nvcc --compiler-options '-fPIC' --shared $(INC) $(LIB) -I../../cgbn-master/include -arch=sm_75 powm_odd.cu -o libpowmosm75.so -lgmp -g
+	nvcc --compiler-options '-fPIC' --shared $(INC) $(LIB) -I../../cgbn-master/include -arch=sm_75 powm_odd.cu -o libpowmosm75.so -lgmp
 
-all: kepler maxwell pascal volta turing
+turingdebug:
+	nvcc --compiler-options '-fPIC' --shared $(INC) $(LIB) -I../../cgbn-master/include -arch=sm_75 powm_odd.cu -o libpowmosm75.so -lgmp -g -DTRACE
+

@@ -33,25 +33,17 @@ enum kernel {
 };
 
 // Prepare a kernel run
-const char* upload(const uint32_t instance_count, void *stream, size_t inputsUploadSize, size_t constantsUploadSize, size_t outputsDownloadSize);
+const char* upload(const uint32_t instance_count, void *stream, enum kernel whichToRun);
 // Enqueue a kernel run
-const char* run(void *stream, enum kernel whichToRun);
+const char* run(void *stream);
 // Enqueue download from a previous kernel launch
 const char* download(void *stream);
 // Wait for a results download to finish
-struct return_data* getResults(void *stream);
+const char* getResults(void *stream);
 
 struct streamCreateInfo {
-  // How many instances can be invoked in a kernel launch?
+  // How much memory is available for the stream to use?
   size_t capacity;
-  // What's the size in bytes of the entire input buffer?
-  // (assumed to be linear in size with number of inputs)
-  size_t inputsCapacity;
-  // What's the size in bytes of the entire output buffer?
-  // (assumed to be linear in size with number of inputs)
-  size_t outputsCapacity;
-  // What's the size in bytes of the entire constants buffer?
-  size_t constantsCapacity;
 };
 
 
@@ -64,7 +56,7 @@ const char* destroyStream(void *destroyee);
 
 // Get a pointer to the CPU inputs buffer from a stream
 // Overwrite this memory with inputs before enqueueing an upload
-void* getCpuInputs(void* stream);
+void* getCpuInputs(void* stream, enum kernel op);
 
 // Get a pointer to the CPU outputs buffer from a stream
 // Read outputs from this memory after calling getResults to synchronize the event
@@ -74,11 +66,12 @@ void* getCpuOutputs(void* stream);
 // Overwrite this memory with constants before enqueueing an upload
 void* getCpuConstants(void* stream);
 
-// Call this after execution has completed to write out profile information to the disk
-const char* stopProfiling();
-
-// Calling this is optional if you profile from the start of execution.
-const char* startProfiling();
+// Get memory size required for a certain op's constants buffer
+size_t getConstantsSize(enum kernel op);
+// Get memory size required for a certain op's inputs buffer
+size_t getInputSize(enum kernel op);
+// Get memory size required for a certain op's outputs buffer
+size_t getOutputSize(enum kernel op);
 
 // If using the newer profiler, use this instead when kernels have finished 
 // running to signal the profiler that execution has finished.
