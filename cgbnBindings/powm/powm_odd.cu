@@ -32,8 +32,6 @@ IN THE SOFTWARE.
 #include "../utility/support.h"
 #include "powm_odd_export.h"
 
-//#define TRACE
-
 // Stream object and associated data for a stream
 // This name could perhaps be better...
 struct streamData {
@@ -41,36 +39,24 @@ struct streamData {
   // this one
   cudaStream_t stream;
 
-  // Device buffer uploaded to before execution
-  // Contains multiple items
-  void *gpuInputs;
-  // Device buffer downloaded from after execution
-  // Contains multiple items
-  void *gpuOutputs;
-  // Device data that's the same for all items, uploaded to before execution
-  // For instance, can contain the modulus.
-  // Note: This currently uses global memory, not constant memory.
-  // It isn't a constant buffer.
-  void *gpuConstants;
+  // Area of device memory that this stream can use
+  void *gpuMem;
   
-  // Host buffer downloaded to after execution
-  // This is allocated with pinned memory that can be transferred with the DMA
-  void *cpuOutputs;
-  void *cpuInputs;
-  void *cpuConstants;
+  // Area of host memory that this stream can use
+  // This buffer is pinned memory
+  void *cpuMem;
 
-  // Size of buffers at max capacity (set at creation time)
-  size_t inputsCapacity;
-  size_t outputsCapacity;
-  size_t constantsCapacity;
+  // Total size of buffers at max capacity (set at creation time)
+  size_t memCapacity;
 
-  // Size of uploads and downloads for this launch (set at upload time)
+  // Size of input and output regions for this launch (set at upload time)
+  // Input region will only have host to device transfer, output region will only have device to host transfer
+  // Input region always comes first, and output region always comes right afterwards
   size_t inputsLength;
   size_t outputsLength;
-  size_t constantsLength;
 
-  // Number of items that can be held in the buffers associated with this stream
-  size_t capacity;
+  enum kernel whichToRun;
+
   // Number of items to be processed with this part of the stream
   size_t length;
 
@@ -114,6 +100,7 @@ class powm_params_t {
   static const uint32_t WINDOW_BITS=window_bits;   // window size
 };
 
+// Really I'd like this class to have very few responsibilities overall, and be able to invoke an exponentiation in the same way I'd invoke any of the native cgbn methods
 template<class params>
 class cmixPrecomp {
   public:
@@ -289,7 +276,7 @@ class cmixPrecomp {
 // Unfortunately, the kernel must be separate from the cmixPrecomp class
 // kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 template<class params>
-__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename cmixPrecomp<params>::powm_odd_input_t *inputs, cgbn_mem_t<params::BITS> *modulus, cgbn_mem_t<params::BITS> *outputs, size_t count) {
+__global__ void kernel_powm_odd(cgbn_error_report_t *report, cgbn_mem_t<params::BITS> *constants, typename cmixPrecomp<params>::powm_odd_input_t *inputs, cgbn_mem_t<params::BITS> *outputs, size_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -304,7 +291,7 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename cmixPrecom
   // here and to pass in and out bignums
   cgbn_load(po._env, x, &(inputs[instance].x));
   cgbn_load(po._env, p, &(inputs[instance].power));
-  cgbn_load(po._env, m, modulus);
+  cgbn_load(po._env, m, constants);
   
   // this can be either fixed_window_powm_odd or sliding_window_powm_odd.
   // when TPI<32, fixed window runs much faster because it is less divergent, so we use it here
@@ -318,7 +305,7 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename cmixPrecom
 }
 
 template<class params>
-__global__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp<params>::elgamal_input_t *inputs, typename cmixPrecomp<params>::elgamal_constant_t *constants, typename cmixPrecomp<params>::elgamal_output_t *outputs, size_t count) {
+__global__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp<params>::elgamal_constant_t *constants, typename cmixPrecomp<params>::elgamal_input_t *inputs, typename cmixPrecomp<params>::elgamal_output_t *outputs, size_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -369,10 +356,8 @@ __global__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp
 // The results will be placed in the stream's gpu outputs buffer some time after the kernel launch
 // Precondition: stream should have had upload called on it
 template<class params>
-const char* run(streamData *stream, kernel whichToRun) {
-#ifdef TRACE
-  printf("run (streamData, kernel)\n");
-#endif
+const char* run(streamData *stream) {
+  debugPrint("run (streamData, kernel)");
   const int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
 
@@ -382,16 +367,15 @@ const char* run(streamData *stream, kernel whichToRun) {
   //  Organize with enumeration? Is it possible to use templates to make this better?
   typedef cgbn_mem_t<params::BITS> mem_t;
 
-  switch (whichToRun) {
+  switch (stream->whichToRun) {
   case KERNEL_POWM_ODD:
     {
       typedef typename cmixPrecomp<params>::powm_odd_input_t input_t;
+      mem_t* gpuConstants = (mem_t*)stream->gpuMem;
+      input_t* gpuInputs = (input_t*)(gpuConstants+1);
+      mem_t* gpuOutputs = (mem_t*)(gpuInputs+stream->length);
       kernel_powm_odd<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
-        stream->report, 
-        (input_t*)stream->gpuInputs, 
-        (mem_t*)stream->gpuConstants, 
-        (mem_t*)stream->gpuOutputs, 
-        stream->length);
+        stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
     }
     break;
   case KERNEL_ELGAMAL:
@@ -399,12 +383,11 @@ const char* run(streamData *stream, kernel whichToRun) {
       typedef typename cmixPrecomp<params>::elgamal_input_t input_t;
       typedef typename cmixPrecomp<params>::elgamal_output_t output_t;
       typedef typename cmixPrecomp<params>::elgamal_constant_t constant_t;
+      constant_t* gpuConstants = (constant_t*)stream->gpuMem;
+      input_t* gpuInputs = (input_t*)(gpuConstants+1);
+      output_t* gpuOutputs = (output_t*)(gpuInputs+stream->length);
       kernel_elgamal<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
-        stream->report, 
-        (input_t*)stream->gpuInputs, 
-        (constant_t*)stream->gpuConstants, 
-        (output_t*)stream->gpuOutputs, 
-        stream->length);
+        stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
     }
     break;
   case KERNEL_MUL2:
@@ -421,9 +404,7 @@ const char* run(streamData *stream, kernel whichToRun) {
 }
 
 const char* getResults(streamData *stream) {
-#ifdef TRACE
-  printf("getResults (streamData)\n");
-#endif
+  debugPrint("getResults (streamData)");
   // Wait for download to complete
   CUDA_CHECK_RETURN(cudaEventSynchronize(stream->deviceToHost));
   // Not sure if we can check the error report before this (e.g. in download function)
@@ -431,31 +412,43 @@ const char* getResults(streamData *stream) {
   return NULL;
 }
 
+// Get the location where the outputs start for uploading
+//  TODO Should this be located somewhere else? Could I reduce redundancy if I make different classes for each op? (for instance)
+//  Basically this design seems suboptimal in some way
+template <class Input, class Constant>
+void* getOutputs(void* mem, size_t numItems) {
+  debugPrint("getOutputs (void*, size_t)");
+  // We want to get the location after the inputs and constants
+  // Order doesn't matter and we assume padding doesn't exist
+  // (which should be true if the big numbers are big enough)
+  Constant* constants = (Constant*)mem;
+  // Not sure if this is undefined behaviour? Do I have to reinterpret_cast or cast to void to make this work?
+  Input* inputs = (Input*)(constants+1);
+  return (void*) (inputs+numItems);
+}
+
+// Get the memory address of the beginning of the inputs in a buffer
+// Inputs always come right after constants
+template <class Constant>
+void* getInputs(void* mem) {
+  debugPrint("getInputs (void*, size_t)");
+  Constant* constants = (Constant*)mem;
+  return (void*)(constants+1);
+}
+
 typedef powm_params_t<32, 4096, 5> params4096;
 
 // create a bunch of streams and buffers suitable for running a particular kernel
 inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
-#ifdef TRACE
-  printf("createStream (streamData)\n");
-#endif
-  stream->capacity = createInfo.capacity;
-  stream->constantsCapacity = createInfo.constantsCapacity;
-  stream->outputsCapacity = createInfo.outputsCapacity;
-  stream->inputsCapacity = createInfo.inputsCapacity;
+  debugPrint("createStream (streamData)");
+  stream->memCapacity = createInfo.capacity;
   stream->length = 0;
-  stream->constantsLength = 0;
   stream->outputsLength = 0;
   stream->inputsLength = 0;
   CUDA_CHECK_RETURN(cudaStreamCreate(&(stream->stream)));
-  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuInputs), createInfo.inputsCapacity));
-  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuOutputs), createInfo.outputsCapacity));
-  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuConstants), createInfo.constantsCapacity));
+  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuMem), createInfo.capacity));
   CUDA_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
-  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuOutputs), createInfo.outputsCapacity, cudaHostAllocDefault));
-
-  // Both of these next buffers should only be written on the host, so they can be allocated write-combined
-  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuInputs), createInfo.inputsCapacity, cudaHostAllocWriteCombined));
-  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuConstants), createInfo.constantsCapacity, cudaHostAllocWriteCombined));
+  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuMem), createInfo.capacity, cudaHostAllocDefault));
 
   // These events are created with timing disabled because it takes time 
   // to get the timing data, and we don't need it.
@@ -471,46 +464,32 @@ inline const char* createStream(streamCreateInfo createInfo, streamData* stream)
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
 extern "C" {
-  // Enqueue upload data for a powm kernel run for 4K bits
+  // Enqueue upload for a specific kernel
   // Stage input data by copying to the stream's constants and inputs memory before calling
-  const char* upload(const uint32_t instance_count, void *stream, size_t inputsUploadSize, size_t constantsUploadSize, size_t outputsDownloadSize) {
-#ifdef TRACE
-    printf("upload (void)\n");
-#endif
+  const char* upload(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+  debugPrint("upload (void)");
     auto gpuData = (streamData*)stream;
     // Previous download must finish before data are uploaded
     CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
     
     // Set instance count; it's re-used when the kernel gets run later
     gpuData->length = instance_count;
-    // If there are more instances uploaded than the stream can handle, that's an error
-    // At least for now
-    if (gpuData->length > gpuData->capacity) {
-      return strdup("upload_powm error: length greater than capacity\n");
-    }
     // It also doesn't take too long to bounds check the requested data transfer sizes
     // to avoid segmentation faults
-    if (gpuData->inputsCapacity < inputsUploadSize) {
-      return strdup("upload error: input upload size greater than capacity\n");
-    }
-    if (gpuData->constantsCapacity < constantsUploadSize) {
-      return strdup("upload error: constants upload size greater than capacity\n");
-    }
-    if (gpuData->outputsCapacity < outputsDownloadSize) {
-      return strdup("upload error: outputs download size greater than capacity\n");
+    // Avoid these errors by querying the stream for how many items of a particular kernel it can run before uploading
+    size_t inputsUploadSize = getInputSize(whichToRun) * instance_count + getConstantsSize(whichToRun);
+    size_t outputsDownloadSize = getOutputSize(whichToRun) * instance_count;
+    if (inputsUploadSize + outputsDownloadSize > gpuData->memCapacity) {
+      return strdup("upload error: inputs+outputs larger than stream capacity\n");
     }
 
     // At this point, everything should be in a good state, so set the needed variables
     gpuData->inputsLength = inputsUploadSize;
     gpuData->outputsLength = outputsDownloadSize;
-    gpuData->constantsLength = constantsUploadSize;
+    gpuData->whichToRun = whichToRun;
 
-    CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuInputs, gpuData->cpuInputs, gpuData->inputsLength,
-          cudaMemcpyHostToDevice, gpuData->stream));
-
-    // Currently, we're copying to the constants before each kernel launch
-    // This might not be necessary, but it's not that much data
-    CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuConstants, gpuData->cpuConstants, gpuData->constantsLength,
+    // Upload the inputs
+    CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuMem, gpuData->cpuMem, gpuData->inputsLength,
           cudaMemcpyHostToDevice, gpuData->stream));
 
     // Run should wait on this event for kernel launch
@@ -521,44 +500,56 @@ extern "C" {
   }
   
   // Run powm for 4K bits
-  const char* run(void *stream, kernel whichToRun) {
-#ifdef TRACE
-    printf("run (void)\n");
-#endif
-    return run<params4096>((streamData*)stream, whichToRun);
+  const char* run(void *stream) {
+    debugPrint("run (void)");
+    return run<params4096>((streamData*)stream);
   }
 
   const char* download(void *s) {
-#ifdef TRACE
-    printf("download (void)\n");
-#endif
+    debugPrint("download (void)");
     auto stream = (streamData*)s;
     // Wait for the kernel to finish running
     CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
 
     // The kernel ran successfully, so we get the results off the GPU
-    CUDA_CHECK_RETURN(cudaMemcpyAsync(stream->cpuOutputs, stream->gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
+    // Outputs come right after the inputs
+    // TODO: Do this differently (need to not do arithmetic on void pointer for it to be valid)
+    // Specifically, I know what the byte length should be in this buffer because the operation is specified
+    // Basically, we're completing the type manually for bindings compatibility reasons
+    // Otherwise we'd have to template(?) the streamData struct with the input, output, and constant types
+    // and cast the cpu and gpu buffers to the right structure depending on the operation.
+    // 
+    // For now, just instantiate with types for elgamal 4k?
+    // This is a mess. We should just be able to pass "elgamal" or, at worst, "elgamal<params4096>" 
+    // I'd rather not have to switch all the types and instantiate different classes based on the cryptop but that's a limitation on Cgo.
+    void *cpuOutputs, *gpuOutputs;
+    switch (stream->whichToRun) {
+    case KERNEL_ELGAMAL:
+      cpuOutputs = getOutputs<cmixPrecomp<params4096>::elgamal_input_t, cmixPrecomp<params4096>::elgamal_constant_t>(stream->cpuMem, stream->length);
+      gpuOutputs = getOutputs<cmixPrecomp<params4096>::elgamal_input_t, cmixPrecomp<params4096>::elgamal_constant_t>(stream->gpuMem, stream->length);
+      break;
+    case KERNEL_POWM_ODD:
+      cpuOutputs = getOutputs<cmixPrecomp<params4096>::powm_odd_input_t, cmixPrecomp<params4096>::mem_t>(stream->cpuMem, stream->length);
+      gpuOutputs = getOutputs<cmixPrecomp<params4096>::powm_odd_input_t, cmixPrecomp<params4096>::mem_t>(stream->gpuMem, stream->length);
+      break;
+    default:
+      return strdup("Unknown kernel for download; unable to find location of outputs in buffer\n");
+    }
+    CUDA_CHECK_RETURN(cudaMemcpyAsync(cpuOutputs, gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
     CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
 
     return NULL;
   }
 
-  struct return_data* getResults(void *stream) {
-#ifdef TRACE
-    printf("getResults (void)\n");
-#endif
-    return_data* result = (return_data*)malloc(sizeof(*result));
-    result->result = ((streamData*)stream)->cpuOutputs;
-    result->error = getResults((streamData*)stream);
-    return result;
+  const char* getResults(void *stream) {
+    debugPrint("getResults (void)");
+    return getResults((streamData*)stream);
   }
 
   // Call this when starting the program to allocate resources
   // Returns stream or error
   struct return_data* createStream(streamCreateInfo createInfo) {
-#ifdef TRACE
-    printf("createStream (streamCreateInfo)\n");
-#endif
+    debugPrint("createStream (streamCreateInfo)");
     return_data* result = (return_data*)malloc(sizeof(*result));
     streamData *s = (streamData*)(malloc(sizeof(*s)));
     result->error = createStream(createInfo, s);
@@ -569,30 +560,16 @@ extern "C" {
   // Call this after execution has completed to deallocate resources
   // Returns error
   const char* destroyStream(void *destroyee) {
-#ifdef TRACE
-    printf("destroyStream (void)\n");
-#endif
+    debugPrint("destroyStream (void)");
     auto stream = (streamData*)destroyee;
     // Don't know at what point there could have been errors while creating this stream,
     // so make sure things exist before destroying them
     if (stream != NULL) {
-      if (stream->gpuInputs != NULL) {
-        CUDA_CHECK_RETURN(cudaFree(stream->gpuInputs));
+      if (stream->gpuMem != NULL) {
+        CUDA_CHECK_RETURN(cudaFree(stream->gpuMem));
       }
-      if (stream->gpuOutputs != NULL) {
-        CUDA_CHECK_RETURN(cudaFree(stream->gpuOutputs));
-      }
-      if (stream->gpuConstants != NULL) {
-        CUDA_CHECK_RETURN(cudaFree(stream->gpuConstants));
-      }
-      if (stream->cpuInputs != NULL) {
-        CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuInputs));
-      }
-      if (stream->cpuOutputs != NULL) {
-        CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuOutputs));
-      }
-      if (stream->cpuConstants != NULL) {
-        CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuConstants));
+      if (stream->cpuMem != NULL) {
+        CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuMem));
       }
       if (stream->report != NULL) {
         CUDA_CHECK_RETURN(cgbn_error_report_free(stream->report));
@@ -613,34 +590,105 @@ extern "C" {
   }
 
   // Call this after execution has completed to write out profile information to the disk
-  const char* stopProfiling() {
-    CUDA_CHECK_RETURN(cudaProfilerStop());
-    return NULL;
-  }
-
-  const char* startProfiling() {
-    CUDA_CHECK_RETURN(cudaProfilerStart());
-    return NULL;
-  }
-
   const char* resetDevice() {
     CUDA_CHECK_RETURN(cudaDeviceReset());
     return NULL;
   }
 
   // Return cpu inputs buffer pointer for writing
-  void* getCpuInputs(void* stream) {
-    return ((streamData*)stream)->cpuInputs;
+  // TODO Implement depending on kernel/length
+  void* getCpuInputs(void* stream, enum kernel op) {
+    streamData* s = (streamData*)stream;
+    switch (op) {
+      case KERNEL_ELGAMAL:
+        return getInputs<cmixPrecomp<params4096>::elgamal_constant_t>(s->cpuMem);
+        break;
+      case KERNEL_POWM_ODD:
+        return getInputs<cmixPrecomp<params4096>::mem_t>(s->cpuMem);
+        break;
+      case KERNEL_MUL2:
+      default:
+        // Unimplemented
+        return NULL;
+        break;
+    }
   }
 
   // Return cpu outputs buffer pointer for reading
   void* getCpuOutputs(void* stream) {
-    return ((streamData*)stream)->cpuOutputs;
+    streamData* s = (streamData*)stream;
+    switch (s->whichToRun) {
+      case KERNEL_ELGAMAL:
+        return getOutputs<cmixPrecomp<params4096>::elgamal_input_t, cmixPrecomp<params4096>::elgamal_constant_t>(
+            s->cpuMem, s->length);
+        break;
+      case KERNEL_POWM_ODD:
+        return getOutputs<cmixPrecomp<params4096>::powm_odd_input_t, cmixPrecomp<params4096>::mem_t>(
+            s->cpuMem, s->length);
+        break;
+      case KERNEL_MUL2:
+      default:
+        // Unimplemented
+        return NULL;
+        break;
+    }
   }
 
   // Return cpu constants buffer pointer for writing
   void* getCpuConstants(void* stream) {
-    return ((streamData*)stream)->cpuConstants;
+    return ((streamData*)stream)->cpuMem;
   }
+
+  // TODO? Deprecate this and use sizeof / pointer arithmetic instead
+  //  Although, I think we might need this for slicing things on the go side
+  // TODO? Support different bit lengths
+  size_t getConstantsSize(enum kernel op) {
+    switch (op) {
+      case KERNEL_ELGAMAL:
+        return sizeof(cmixPrecomp<params4096>::elgamal_constant_t);
+        break;
+      case KERNEL_POWM_ODD:
+        return sizeof(cmixPrecomp<params4096>::mem_t);
+        break;
+      case KERNEL_MUL2:
+      default:
+        // Unimplemented
+        return 0;
+        break;
+    }
+  }
+
+  size_t getInputSize(enum kernel op) {
+    switch (op) {
+      case KERNEL_ELGAMAL:
+        return sizeof(cmixPrecomp<params4096>::elgamal_input_t);
+        break;
+      case KERNEL_POWM_ODD:
+        return sizeof(cmixPrecomp<params4096>::powm_odd_input_t);
+        break;
+      case KERNEL_MUL2:
+      default:
+        // Unimplemented
+        return 0;
+        break;
+    }
+  }
+
+  size_t getOutputSize(enum kernel op) {
+    switch (op) {
+      case KERNEL_ELGAMAL:
+        return sizeof(cmixPrecomp<params4096>::elgamal_output_t);
+        break;
+      case KERNEL_POWM_ODD:
+        return sizeof(cmixPrecomp<params4096>::mem_t);
+        break;
+      case KERNEL_MUL2:
+      default:
+        // Unimplemented
+        return 0;
+        break;
+    }
+  }
+
 }
 

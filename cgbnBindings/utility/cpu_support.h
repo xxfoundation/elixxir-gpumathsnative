@@ -130,3 +130,10 @@ void random_words(uint32_t *x, uint32_t count) {
   for(index=0;index<count;index++)
     x[index]=random_word();
 }
+
+void debugPrint(const char* s) {
+#ifdef TRACE
+  printf("%s\n", s);
+#endif
+}
+
