@@ -26,7 +26,7 @@ devinstall:
 
 install:
 	mkdir -p /opt/elixxir/lib
-	mv libpowmo*.so /opt/elixxir/lib
+	cp libpowmo*.so /opt/elixxir/lib
 
 kepler:
 	nvcc --compiler-options '-fPIC' --shared $(INC) $(LIB) -I../../cgbn-master/include -arch=sm_30 powm_odd.cu -o libpowmosm40.so -lgmp
