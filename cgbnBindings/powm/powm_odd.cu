@@ -270,24 +270,21 @@ class cmixPrecomp {
     }
   }
 
-
-
-  // Do rootCoprime to a single item in the launched kernel
+  // Find a modular root
+  // Precondition: Z is coprime to prime - 1
   __device__ __forceinline__ void root_coprime(bn_t &result, const bn_t &cypher, const bn_t &Z, const bn_t &prime) {
     bn_t psub1;
     // prime should always be large, so don't check return value
     _env.cgbn_sub(psub1, prime, 1);
-    // Invert (uses p minus 1)
     bool ok = _env.cgbn_modular_inverse(result, Z, psub1);
-    // Convert to Montgomery
     if (ok) {
+      // Found inverse successfully, so do the exponentiation
       uint32_t np0 = _env.cgbn_bn2mont(cypher, cypher, prime);
-      // Exponentiate? (uses group normally, requires mont number)
       fixed_window_powm_odd(cypher, cypher, result, prime, np0);
-      // Convert back to bn
       _env.cgbn_mont2bn(result, cypher, prime, np0);
     } else {
-      // TODO The inversion result was undefined, so we must report an error
+      // The inversion result was undefined, so we must report an error
+      _context.report_error(cgbn_inverse_does_not_exist_error);
     }
   }
 };
