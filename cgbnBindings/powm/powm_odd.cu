@@ -136,6 +136,15 @@ class cmixPrecomp {
     mem_t Z;
   } reveal_constant_t;
 
+  typedef struct {
+    mem_t payload;
+    mem_t cypher;
+  } strip_input_t;
+  typedef struct {
+    mem_t payload;
+    mem_t cypher;
+  } strip_output_t;
+
   typedef cgbn_context_t<params::TPI, params>   context_t;
   typedef cgbn_env_t<context_t, params::BITS>   env_t;
   typedef typename env_t::cgbn_t                bn_t;
@@ -276,7 +285,7 @@ class cmixPrecomp {
 
   // Find a modular root
   // Precondition: Z is coprime to prime - 1
-  __device__ __forceinline__ void root_coprime(bn_t &result, const bn_t &cypher, const bn_t &Z, const bn_t &prime) {
+  __device__ __forceinline__ bool root_coprime(bn_t &result, const bn_t &cypher, const bn_t &Z, const bn_t &prime) {
     bn_t psub1, cypherMont;
     // prime should always be large, so don't check return value
     cgbn_sub_ui32(_env, psub1, prime, uint32_t(1));
@@ -290,6 +299,7 @@ class cmixPrecomp {
       // The inversion result was undefined, so we must report an error
       _context.report_error(cgbn_inverse_does_not_exist_error);
     }
+    return ok;
   }
 };
 
@@ -392,6 +402,46 @@ __global__ void kernel_reveal(cgbn_error_report_t *report, typename cmixPrecomp<
   po.root_coprime(result, cypher, Z, prime);
 
   cgbn_store(po._env, &(outputs[instance]), result);
+}
+
+template<class params>
+__global__ void kernel_strip(cgbn_error_report_t *report, typename cmixPrecomp<params>::reveal_constant_t *constants, typename cmixPrecomp<params>::strip_input_t *inputs, cgbn_mem_t<params::BITS> *outputs, size_t count) {
+  int32_t instance;
+
+  // decode an instance number from the blockIdx and threadIdx
+  instance=(blockIdx.x*blockDim.x + threadIdx.x)/params::TPI;
+  if(instance>=count)
+    return;
+
+  cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
+  typename cmixPrecomp<params>::bn_t  cypher, Z, prime, precomputation, result;
+
+  cgbn_load(po._env, cypher, &(inputs[instance]->cypher));
+  cgbn_load(po._env, Z, &(constants->Z));
+  cgbn_load(po._env, prime, &(constants->prime));
+
+  // Strip runs on the last node only and it begins with a reveal operation
+  bool ok = po.root_coprime(result, cypher, Z, prime);
+  
+  if (ok) {
+    cgbn_load(po._env, precomputation, &(inputs[instance]->precomputation));
+    // It should be possible to get a speedup here, because the
+    // prime is odd
+    ok = cgbn_modular_inverse(po._env, precomputation, precomputation, prime);
+    if (ok) {
+      // It may be possible to do this multiplication faster
+      // This is just a best guess
+      uint32_t np0 = cgbn_bn2mont(po._env, precomputation, precomputation, prime);
+      cgbn_bn2mont(po._env, cypher, cypher, prime);
+      cgbn_mont_mul(po._env, result, precomputation, cypher, prime, np0);
+      cgbn_mont2bn(po._env, result, result, prime, np0);
+      cgbn_store(po._env, &(outputs[instance]), result);
+    } else {
+      // The second modular inverse failed
+      po._context.report_error(cgbn_inverse_does_not_exist_error);
+    }
+  }
+
 }
 
 // Run powm kernel
