@@ -137,13 +137,9 @@ class cmixPrecomp {
   } reveal_constant_t;
 
   typedef struct {
-    mem_t payload;
+    mem_t precomputation;
     mem_t cypher;
   } strip_input_t;
-  typedef struct {
-    mem_t payload;
-    mem_t cypher;
-  } strip_output_t;
 
   typedef cgbn_context_t<params::TPI, params>   context_t;
   typedef cgbn_env_t<context_t, params::BITS>   env_t;
@@ -416,7 +412,7 @@ __global__ void kernel_strip(cgbn_error_report_t *report, typename cmixPrecomp<p
   cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
   typename cmixPrecomp<params>::bn_t  cypher, Z, prime, precomputation, result;
 
-  cgbn_load(po._env, cypher, &(inputs[instance]->cypher));
+  cgbn_load(po._env, cypher, &(inputs[instance].cypher));
   cgbn_load(po._env, Z, &(constants->Z));
   cgbn_load(po._env, prime, &(constants->prime));
 
@@ -424,7 +420,7 @@ __global__ void kernel_strip(cgbn_error_report_t *report, typename cmixPrecomp<p
   bool ok = po.root_coprime(result, cypher, Z, prime);
   
   if (ok) {
-    cgbn_load(po._env, precomputation, &(inputs[instance]->precomputation));
+    cgbn_load(po._env, precomputation, &(inputs[instance].precomputation));
     // It should be possible to get a speedup here, because the
     // prime is odd
     ok = cgbn_modular_inverse(po._env, precomputation, precomputation, prime);
@@ -490,6 +486,17 @@ const char* run(streamData *stream) {
       mem_t* gpuInputs = (mem_t*)(gpuConstants+1);
       mem_t* gpuOutputs = (mem_t*)(gpuInputs+stream->length);
       kernel_reveal<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
+          stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
+    }
+    break;
+  case KERNEL_STRIP:
+    {
+      typedef typename cmixPrecomp<params>::reveal_constant_t constant_t;
+      typedef typename cmixPrecomp<params>::strip_input_t input_t;
+      constant_t* gpuConstants = (constant_t*)stream->gpuMem;
+      input_t* gpuInputs = (input_t*)(gpuConstants+1);
+      mem_t* gpuOutputs = (mem_t*)(gpuInputs+stream->length);
+      kernel_strip<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
           stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
     }
     break;
