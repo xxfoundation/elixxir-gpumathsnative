@@ -131,7 +131,11 @@ class cmixPrecomp {
     mem_t publicCypherKey;
   } elgamal_constant_t;
 
-  
+  typedef struct {
+    mem_t prime;
+    mem_t Z;
+  } reveal_constant_t;
+
   typedef cgbn_context_t<params::TPI, params>   context_t;
   typedef cgbn_env_t<context_t, params::BITS>   env_t;
   typedef typename env_t::cgbn_t                bn_t;
@@ -273,15 +277,15 @@ class cmixPrecomp {
   // Find a modular root
   // Precondition: Z is coprime to prime - 1
   __device__ __forceinline__ void root_coprime(bn_t &result, const bn_t &cypher, const bn_t &Z, const bn_t &prime) {
-    bn_t psub1;
+    bn_t psub1, cypherMont;
     // prime should always be large, so don't check return value
-    _env.cgbn_sub(psub1, prime, 1);
-    bool ok = _env.cgbn_modular_inverse(result, Z, psub1);
+    cgbn_sub_ui32(_env, psub1, prime, uint32_t(1));
+    bool ok = cgbn_modular_inverse(_env, result, Z, psub1);
     if (ok) {
       // Found inverse successfully, so do the exponentiation
-      uint32_t np0 = _env.cgbn_bn2mont(cypher, cypher, prime);
-      fixed_window_powm_odd(cypher, cypher, result, prime, np0);
-      _env.cgbn_mont2bn(result, cypher, prime, np0);
+      uint32_t np0 = cgbn_bn2mont(_env, cypherMont, cypher, prime);
+      fixed_window_powm_odd(cypherMont, cypherMont, result, prime, np0);
+      cgbn_mont2bn(_env, result, cypherMont, prime, np0);
     } else {
       // The inversion result was undefined, so we must report an error
       _context.report_error(cgbn_inverse_does_not_exist_error);
@@ -369,6 +373,27 @@ __global__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp
   cgbn_store(po._env, &(outputs[instance].cypher), result);
 }
 
+template<class params>
+__global__ void kernel_reveal(cgbn_error_report_t *report, typename cmixPrecomp<params>::reveal_constant_t *constants, cgbn_mem_t<params::BITS> *inputs, cgbn_mem_t<params::BITS> *outputs, size_t count) {
+  int32_t instance;
+
+  // decode an instance number from the blockIdx and threadIdx
+  instance=(blockIdx.x*blockDim.x + threadIdx.x)/params::TPI;
+  if(instance>=count)
+    return;
+
+  cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
+  typename cmixPrecomp<params>::bn_t  cypher, Z, prime, result;
+
+  cgbn_load(po._env, cypher, &(inputs[instance]));
+  cgbn_load(po._env, Z, &(constants->Z));
+  cgbn_load(po._env, prime, &(constants->prime));
+
+  po.root_coprime(result, cypher, Z, prime);
+
+  cgbn_store(po._env, &(outputs[instance]), result);
+}
+
 // Run powm kernel
 // Enqueues kernel on the stream and returns immediately (non-blocking)
 // The results will be placed in the stream's gpu outputs buffer some time after the kernel launch
@@ -406,6 +431,16 @@ const char* run(streamData *stream) {
       output_t* gpuOutputs = (output_t*)(gpuInputs+stream->length);
       kernel_elgamal<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
         stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
+    }
+    break;
+  case KERNEL_REVEAL:
+    {
+      typedef typename cmixPrecomp<params>::reveal_constant_t constant_t;
+      constant_t* gpuConstants = (constant_t*)stream->gpuMem;
+      mem_t* gpuInputs = (mem_t*)(gpuConstants+1);
+      mem_t* gpuOutputs = (mem_t*)(gpuInputs+stream->length);
+      kernel_reveal<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
+          stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
     }
     break;
   case KERNEL_MUL2:

@@ -29,6 +29,7 @@ struct return_data {
 enum kernel {
   KERNEL_POWM_ODD,
   KERNEL_ELGAMAL,
+  KERNEL_REVEAL,
   KERNEL_MUL2,
 };
 
