@@ -642,6 +642,14 @@ extern "C" {
       cpuOutputs = getOutputs<cmixPrecomp<params4096>::powm_odd_input_t, cmixPrecomp<params4096>::mem_t>(stream->cpuMem, stream->length);
       gpuOutputs = getOutputs<cmixPrecomp<params4096>::powm_odd_input_t, cmixPrecomp<params4096>::mem_t>(stream->gpuMem, stream->length);
       break;
+    case KERNEL_REVEAL:
+      cpuOutputs = getOutputs<cmixPrecomp<params4096>::mem_t, cmixPrecomp<params4096>::reveal_constant_t>(stream->cpuMem, stream->length);
+      gpuOutputs = getOutputs<cmixPrecomp<params4096>::mem_t, cmixPrecomp<params4096>::reveal_constant_t>(stream->gpuMem, stream->length);
+      break;
+    case KERNEL_STRIP:
+      cpuOutputs = getOutputs<cmixPrecomp<params4096>::strip_input_t, cmixPrecomp<params4096>::reveal_constant_t>(stream->cpuMem, stream->length);
+      gpuOutputs = getOutputs<cmixPrecomp<params4096>::strip_input_t, cmixPrecomp<params4096>::reveal_constant_t>(stream->gpuMem, stream->length);
+      break;
     default:
       return strdup("Unknown kernel for download; unable to find location of outputs in buffer\n");
     }
@@ -716,6 +724,12 @@ extern "C" {
       case KERNEL_POWM_ODD:
         return getInputs<cmixPrecomp<params4096>::mem_t>(s->cpuMem);
         break;
+      case KERNEL_REVEAL:
+        return getInputs<cmixPrecomp<params4096>::reveal_constant_t>(s->cpuMem);
+        break;
+      case KERNEL_STRIP:
+        return getInputs<cmixPrecomp<params4096>::reveal_constant_t>(s->cpuMem);
+        break;
       case KERNEL_MUL2:
       default:
         // Unimplemented
@@ -734,6 +748,14 @@ extern "C" {
         break;
       case KERNEL_POWM_ODD:
         return getOutputs<cmixPrecomp<params4096>::powm_odd_input_t, cmixPrecomp<params4096>::mem_t>(
+            s->cpuMem, s->length);
+        break;
+      case KERNEL_REVEAL:
+        return getOutputs<cmixPrecomp<params4096>::mem_t, cmixPrecomp<params4096>::reveal_constant_t>(
+            s->cpuMem, s->length);
+        break;
+      case KERNEL_STRIP:
+        return getOutputs<cmixPrecomp<params4096>::strip_input_t, cmixPrecomp<params4096>::reveal_constant_t>(
             s->cpuMem, s->length);
         break;
       case KERNEL_MUL2:
@@ -760,6 +782,12 @@ extern "C" {
       case KERNEL_POWM_ODD:
         return sizeof(cmixPrecomp<params4096>::mem_t);
         break;
+      case KERNEL_REVEAL:
+        return sizeof(cmixPrecomp<params4096>::reveal_constant_t);
+        break;
+      case KERNEL_STRIP:
+        return sizeof(cmixPrecomp<params4096>::reveal_constant_t);
+        break;
       case KERNEL_MUL2:
       default:
         // Unimplemented
@@ -776,6 +804,12 @@ extern "C" {
       case KERNEL_POWM_ODD:
         return sizeof(cmixPrecomp<params4096>::powm_odd_input_t);
         break;
+      case KERNEL_REVEAL:
+        return sizeof(cmixPrecomp<params4096>::mem_t);
+        break;
+      case KERNEL_STRIP:
+        return sizeof(cmixPrecomp<params4096>::strip_input_t);
+        break;
       case KERNEL_MUL2:
       default:
         // Unimplemented
@@ -790,6 +824,12 @@ extern "C" {
         return sizeof(cmixPrecomp<params4096>::elgamal_output_t);
         break;
       case KERNEL_POWM_ODD:
+        return sizeof(cmixPrecomp<params4096>::mem_t);
+        break;
+      case KERNEL_REVEAL:
+        return sizeof(cmixPrecomp<params4096>::mem_t);
+        break;
+      case KERNEL_STRIP:
         return sizeof(cmixPrecomp<params4096>::mem_t);
         break;
       case KERNEL_MUL2:
