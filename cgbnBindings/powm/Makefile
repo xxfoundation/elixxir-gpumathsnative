@@ -23,11 +23,12 @@ clean:
 devinstall:
 	mkdir -p ../../lib
 	mv libpowmo*.so ../../lib
+	cp powm_odd_export.h ../../lib
 
 install:
 	mkdir -p /opt/xxnetwork/lib
 	mkdir -p /opt/xxnetwork/include
-	cp libpowmo*.so /opt/xxnetwork/lib
+	mv libpowmo*.so /opt/xxnetwork/lib
 	cp powm_odd_export.h /opt/xxnetwork/include
 
 kepler:
