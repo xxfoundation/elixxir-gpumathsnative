@@ -23,10 +23,13 @@ clean:
 devinstall:
 	mkdir -p ../../lib
 	mv libpowmo*.so ../../lib
+	cp powm_odd_export.h ../../lib
 
 install:
-	mkdir -p /opt/elixxir/lib
-	mv libpowmo*.so /opt/elixxir/lib
+	mkdir -p /opt/xxnetwork/lib
+	mkdir -p /opt/xxnetwork/include
+	mv libpowmo*.so /opt/xxnetwork/lib
+	cp powm_odd_export.h /opt/xxnetwork/include
 
 kepler:
 	nvcc --compiler-options '-fPIC' --shared $(INC) $(LIB) -I../../cgbn-master/include -arch=sm_30 powm_odd.cu -o libpowmosm40.so -lgmp
