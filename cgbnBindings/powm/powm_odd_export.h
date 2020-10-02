@@ -35,11 +35,17 @@ enum kernel {
 };
 
 // Prepare a kernel run
-const char* upload(const uint32_t instance_count, void *stream, enum kernel whichToRun);
+const char* upload4096(const uint32_t instance_count, void *stream, enum kernel whichToRun);
+const char* upload3200(const uint32_t instance_count, void *stream, enum kernel whichToRun);
+const char* upload2048(const uint32_t instance_count, void *stream, enum kernel whichToRun);
 // Enqueue a kernel run
-const char* run(void *stream);
+const char* run4096(void *stream);
+const char* run3200(void *stream);
+const char* run2048(void *stream);
 // Enqueue download from a previous kernel launch
-const char* download(void *stream);
+const char* download4096(void *stream);
+const char* download3200(void *stream);
+const char* download2048(void *stream);
 // Wait for a results download to finish
 const char* getResults(void *stream);
 
@@ -58,22 +64,32 @@ const char* destroyStream(void *destroyee);
 
 // Get a pointer to the CPU inputs buffer from a stream
 // Overwrite this memory with inputs before enqueueing an upload
-void* getCpuInputs(void* stream, enum kernel op);
+void* getCpuInputs4096(void* stream, enum kernel op);
+void* getCpuInputs3200(void* stream, enum kernel op);
+void* getCpuInputs2048(void* stream, enum kernel op);
 
 // Get a pointer to the CPU outputs buffer from a stream
 // Read outputs from this memory after calling getResults to synchronize the event
-void* getCpuOutputs(void* stream);
+void* getCpuOutputs4096(void* stream);
+void* getCpuOutputs3200(void* stream);
+void* getCpuOutputs2048(void* stream);
 
 // Get a pointer to the CPU constants buffer from a stream
 // Overwrite this memory with constants before enqueueing an upload
 void* getCpuConstants(void* stream);
 
 // Get memory size required for a certain op's constants buffer
-size_t getConstantsSize(enum kernel op);
+size_t getConstantsSize4096(enum kernel op);
+size_t getConstantsSize3200(enum kernel op);
+size_t getConstantsSize2048(enum kernel op);
 // Get memory size required for a certain op's inputs buffer
-size_t getInputSize(enum kernel op);
+size_t getInputSize4096(enum kernel op);
+size_t getInputSize3200(enum kernel op);
+size_t getInputSize2048(enum kernel op);
 // Get memory size required for a certain op's outputs buffer
-size_t getOutputSize(enum kernel op);
+size_t getOutputSize4096(enum kernel op);
+size_t getOutputSize3200(enum kernel op);
+size_t getOutputSize2048(enum kernel op);
 
 // If using the newer profiler, use this instead when kernels have finished 
 // running to signal the profiler that execution has finished.

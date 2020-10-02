@@ -583,7 +583,10 @@ void* getInputs(void* mem) {
   return (void*)(constants+1);
 }
 
+
 typedef powm_params_t<32, 4096, 5> params4096;
+typedef powm_params_t<32, 3200, 5> params3200;
+typedef powm_params_t<32, 2048, 5> params2048;
 
 // create a bunch of streams and buffers suitable for running a particular kernel
 inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
@@ -607,99 +610,328 @@ inline const char* createStream(streamCreateInfo createInfo, streamData* stream)
   return NULL;
 }
 
+// TODO? Deprecate this and use sizeof / pointer arithmetic instead
+//  Although, I think we might need this for slicing things on the go side
+// TODO? Support different bit lengths
+template<class cgbnParams>
+size_t getConstantsSize(enum kernel op) {
+  switch (op) {
+    case KERNEL_ELGAMAL:
+      return sizeof(typename cmixPrecomp<cgbnParams>::elgamal_constant_t);
+      break;
+    case KERNEL_POWM_ODD:
+    case KERNEL_MUL2:
+      return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
+      break;
+    case KERNEL_REVEAL:
+    case KERNEL_STRIP:
+      return sizeof(typename cmixPrecomp<cgbnParams>::reveal_constant_t);
+      break;
+    default:
+      // Unimplemented
+      return 0;
+      break;
+  }
+}
+
+template<class cgbnParams>
+size_t getInputSize(enum kernel op) {
+  switch (op) {
+    case KERNEL_ELGAMAL:
+      return sizeof(typename cmixPrecomp<cgbnParams>::elgamal_input_t);
+      break;
+    case KERNEL_POWM_ODD:
+      return sizeof(typename cmixPrecomp<cgbnParams>::powm_odd_input_t);
+      break;
+    case KERNEL_REVEAL:
+      return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
+      break;
+    case KERNEL_STRIP:
+      return sizeof(typename cmixPrecomp<cgbnParams>::strip_input_t);
+      break;
+    case KERNEL_MUL2:
+      return sizeof(typename cmixPrecomp<cgbnParams>::mul2_input_t);
+      break;
+    default:
+      // Unimplemented
+      return 0;
+      break;
+  }
+}
+
+template<class cgbnParams>
+size_t getOutputSize(enum kernel op) {
+  switch (op) {
+    case KERNEL_ELGAMAL:
+      return sizeof(typename cmixPrecomp<cgbnParams>::elgamal_output_t);
+      break;
+    case KERNEL_POWM_ODD:
+    case KERNEL_REVEAL:
+    case KERNEL_STRIP:
+    case KERNEL_MUL2:
+      // Most ops just return one number
+      return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
+      break;
+    default:
+      // Unimplemented
+      return 0;
+      break;
+  }
+}
+
+// Enqueue upload for a specific kernel
+// Stage input data by copying to the stream's constants and inputs memory before calling
+template<class cgbnParams>
+const char* upload(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+  auto gpuData = (streamData*)stream;
+  // Previous download must finish before data are uploaded
+  CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
+  
+  // Set instance count; it's re-used when the kernel gets run later
+  gpuData->length = instance_count;
+  // It also doesn't take too long to bounds check the requested data transfer sizes
+  // to avoid segmentation faults
+  // Avoid these errors by querying the stream for how many items of a particular kernel it can run before uploading
+  size_t inputsUploadSize = getInputSize<cgbnParams>(whichToRun) * instance_count + getConstantsSize<cgbnParams>(whichToRun);
+  size_t outputsDownloadSize = getOutputSize<cgbnParams>(whichToRun) * instance_count;
+  if (inputsUploadSize + outputsDownloadSize > gpuData->memCapacity) {
+    return strdup("upload error: inputs+outputs larger than stream capacity\n");
+  }
+
+  // At this point, everything should be in a good state, so set the needed variables
+  gpuData->inputsLength = inputsUploadSize;
+  gpuData->outputsLength = outputsDownloadSize;
+  gpuData->whichToRun = whichToRun;
+
+  // Upload the inputs
+  CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuMem, gpuData->cpuMem, gpuData->inputsLength,
+        cudaMemcpyHostToDevice, gpuData->stream));
+
+  // Run should wait on this event for kernel launch
+  // The event should include any memcpys that haven't completed yet
+  CUDA_CHECK_RETURN(cudaEventRecord(gpuData->hostToDevice, gpuData->stream));
+
+  return NULL;
+}
+
+// Trigger a kernel run
+template<class cgbnParams>
+const char* run(void *stream) {
+  return run<cgbnParams>((streamData*)stream);
+}
+
+
+template<class cgbnParams>
+const char* download(void *s) {
+  auto stream = (streamData*)s;
+  // Wait for the kernel to finish running
+  CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
+
+  // The kernel ran successfully, so we get the results off the GPU
+  // Outputs come right after the inputs
+  // TODO: Do this differently (need to not do arithmetic on void pointer for it to be valid)
+  // Specifically, I know what the byte length should be in this buffer because the operation is specified
+  // Basically, we're completing the type manually for bindings compatibility reasons
+  // Otherwise we'd have to template(?) the streamData struct with the input, output, and constant types
+  // and cast the cpu and gpu buffers to the right structure depending on the operation.
+  // 
+  // For now, just instantiate with types for elgamal 4k?
+  // This is a mess. We should just be able to pass "elgamal" or, at worst, "elgamal<params4096>" 
+  // I'd rather not have to switch all the types and instantiate different classes based on the cryptop but that's a limitation on Cgo.
+  void *cpuOutputs, *gpuOutputs;
+  typedef typename cmixPrecomp<cgbnParams>::mem_t mem_t;
+  switch (stream->whichToRun) {
+  case KERNEL_ELGAMAL:
+    cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::elgamal_input_t, typename cmixPrecomp<cgbnParams>::elgamal_constant_t>(stream->cpuMem, stream->length);
+    gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::elgamal_input_t, typename cmixPrecomp<cgbnParams>::elgamal_constant_t>(stream->gpuMem, stream->length);
+    break;
+  case KERNEL_POWM_ODD:
+    cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::powm_odd_input_t, mem_t>(stream->cpuMem, stream->length);
+    gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::powm_odd_input_t, mem_t>(stream->gpuMem, stream->length);
+    break;
+  case KERNEL_REVEAL:
+    cpuOutputs = getOutputs<mem_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(stream->cpuMem, stream->length);
+    gpuOutputs = getOutputs<mem_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(stream->gpuMem, stream->length);
+    break;
+  case KERNEL_STRIP:
+    cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::strip_input_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(stream->cpuMem, stream->length);
+    gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::strip_input_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(stream->gpuMem, stream->length);
+    break;
+  case KERNEL_MUL2:
+    cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, mem_t>(stream->cpuMem, stream->length);
+    gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, mem_t>(stream->gpuMem, stream->length);
+    break;
+  default:
+    return strdup("Unknown kernel for download; unable to find location of outputs in buffer\n");
+  }
+  CUDA_CHECK_RETURN(cudaMemcpyAsync(cpuOutputs, gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
+  CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
+
+  return NULL;
+}
+
+// Return cpu inputs buffer pointer for writing
+// TODO Implement depending on kernel/length
+template<class cgbnParams>
+void* getCpuInputs(void* stream, enum kernel op) {
+  streamData* s = (streamData*)stream;
+  switch (op) {
+    case KERNEL_ELGAMAL:
+      return getInputs<typename cmixPrecomp<cgbnParams>::elgamal_constant_t>(s->cpuMem);
+      break;
+    case KERNEL_POWM_ODD:
+    case KERNEL_MUL2:
+      return getInputs<typename cmixPrecomp<cgbnParams>::mem_t>(s->cpuMem);
+      break;
+    case KERNEL_REVEAL:
+      return getInputs<typename cmixPrecomp<cgbnParams>::reveal_constant_t>(s->cpuMem);
+      break;
+    case KERNEL_STRIP:
+      return getInputs<typename cmixPrecomp<cgbnParams>::reveal_constant_t>(s->cpuMem);
+      break;
+    default:
+      // Unimplemented
+      return NULL;
+      break;
+  }
+}
+
+// Return cpu outputs buffer pointer for reading
+template<class cgbnParams>
+void* getCpuOutputs(void* stream) {
+  streamData* s = (streamData*)stream;
+  switch (s->whichToRun) {
+    case KERNEL_ELGAMAL:
+      return getOutputs<typename cmixPrecomp<cgbnParams>::elgamal_input_t, typename cmixPrecomp<cgbnParams>::elgamal_constant_t>(
+          s->cpuMem, s->length);
+      break;
+    case KERNEL_POWM_ODD:
+      return getOutputs<typename cmixPrecomp<cgbnParams>::powm_odd_input_t, typename cmixPrecomp<cgbnParams>::mem_t>(
+          s->cpuMem, s->length);
+      break;
+    case KERNEL_REVEAL:
+      return getOutputs<typename cmixPrecomp<cgbnParams>::mem_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(
+          s->cpuMem, s->length);
+      break;
+    case KERNEL_STRIP:
+      return getOutputs<typename cmixPrecomp<cgbnParams>::strip_input_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(
+          s->cpuMem, s->length);
+      break;
+    case KERNEL_MUL2:
+      return getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, typename cmixPrecomp<cgbnParams>::mem_t>(
+          s->cpuMem, s->length);
+    default:
+      // Unimplemented
+      return NULL;
+      break;
+  }
+}
+
+
 // All the methods used in cgo should have extern "C" linkage to avoid
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
 extern "C" {
-  // Enqueue upload for a specific kernel
-  // Stage input data by copying to the stream's constants and inputs memory before calling
-  const char* upload(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-  debugPrint("upload (void)");
-    auto gpuData = (streamData*)stream;
-    // Previous download must finish before data are uploaded
-    CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
-    
-    // Set instance count; it's re-used when the kernel gets run later
-    gpuData->length = instance_count;
-    // It also doesn't take too long to bounds check the requested data transfer sizes
-    // to avoid segmentation faults
-    // Avoid these errors by querying the stream for how many items of a particular kernel it can run before uploading
-    size_t inputsUploadSize = getInputSize(whichToRun) * instance_count + getConstantsSize(whichToRun);
-    size_t outputsDownloadSize = getOutputSize(whichToRun) * instance_count;
-    if (inputsUploadSize + outputsDownloadSize > gpuData->memCapacity) {
-      return strdup("upload error: inputs+outputs larger than stream capacity\n");
-    }
+  size_t getConstantsSize4096(enum kernel op) {
+    return getConstantsSize<params4096>(op);
+  }
+  size_t getConstantsSize3200(enum kernel op) {
+    return getConstantsSize<params3200>(op);
+  }
+  size_t getConstantsSize2048(enum kernel op) {
+    return getConstantsSize<params2048>(op);
+  }
+  size_t getInputSize4096(enum kernel op) {
+    return getInputSize<params4096>(op);
+  }
+  size_t getInputSize3200(enum kernel op) {
+    return getInputSize<params3200>(op);
+  }
+  size_t getInputSize2048(enum kernel op) {
+    return getInputSize<params2048>(op);
+  }
+  size_t getOutputSize4096(enum kernel op) {
+    return getOutputSize<params4096>(op);
+  }
+  size_t getOutputSize3200(enum kernel op) {
+    return getOutputSize<params3200>(op);
+  }
+  size_t getOutputSize2048(enum kernel op) {
+    return getOutputSize<params2048>(op);
+  }
+  void* getCpuOutputs4096(void* stream) {
+    return getCpuOutputs<params4096>(stream);
+  }
+  void* getCpuOutputs3200(void* stream) {
+    return getCpuOutputs<params3200>(stream);
+  }
+  void* getCpuOutputs2048(void* stream) {
+    return getCpuOutputs<params2048>(stream);
+  }
 
-    // At this point, everything should be in a good state, so set the needed variables
-    gpuData->inputsLength = inputsUploadSize;
-    gpuData->outputsLength = outputsDownloadSize;
-    gpuData->whichToRun = whichToRun;
+  // Return cpu inputs buffer pointer for writing
+  void* getCpuInputs4096(void* stream, enum kernel op) {
+    return getCpuInputs<params4096>(stream, op);
+  }
+  // Return cpu inputs buffer pointer for writing
+  void* getCpuInputs3200(void* stream, enum kernel op) {
+    return getCpuInputs<params3200>(stream, op);
+  }
+  // Return cpu inputs buffer pointer for writing
+  void* getCpuInputs2048(void* stream, enum kernel op) {
+    return getCpuInputs<params2048>(stream, op);
+  }
 
-    // Upload the inputs
-    CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuMem, gpuData->cpuMem, gpuData->inputsLength,
-          cudaMemcpyHostToDevice, gpuData->stream));
+  // Enqueue download after kernel run
+  const char* download4096(void *s) {
+    debugPrint("download (void)");
+    return download<params4096>(s);
+  }
+  // Enqueue download after kernel run
+  const char* download3200(void *s) {
+    debugPrint("download (void)");
+    return download<params3200>(s);
+  }
+  // Enqueue download after kernel run
+  const char* download2048(void *s) {
+    debugPrint("download (void)");
+    return download<params2048>(s);
+  }
 
-    // Run should wait on this event for kernel launch
-    // The event should include any memcpys that haven't completed yet
-    CUDA_CHECK_RETURN(cudaEventRecord(gpuData->hostToDevice, gpuData->stream));
+  // Trigger run for 4096 bits
+  const char* run4096(void* stream) {
+    debugPrint("run4096 (void)");
+    return run<params4096>(stream);
+  }
+  // Trigger run for 3200 bits
+  const char* run3200(void* stream) {
+    debugPrint("run3200 (void)");
+    return run<params3200>(stream);
+  }
+  // Trigger run for 2048 bits
+  const char* run2048(void* stream) {
+    debugPrint("run2048 (void)");
+    return run<params2048>(stream);
+  }
 
-    return NULL;
+  // Run upload for the specified kernel and 4k bits size
+  const char* upload4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    debugPrint("upload4096 (void)");
+    return upload<params4096>(instance_count, stream, whichToRun);
+  }
+
+  // Run upload for the specified kernel and 3k bits size
+  const char* upload3200(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    debugPrint("upload3200 (void)");
+    return upload<params3200>(instance_count, stream, whichToRun);
+  }
+
+  // Run upload for the specified kernel and 2k bits size
+  const char* upload2048(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    debugPrint("upload2048 (void)");
+    return upload<params2048>(instance_count, stream, whichToRun);
   }
   
-  // Run powm for 4K bits
-  const char* run(void *stream) {
-    debugPrint("run (void)");
-    return run<params4096>((streamData*)stream);
-  }
-
-  const char* download(void *s) {
-    debugPrint("download (void)");
-    auto stream = (streamData*)s;
-    // Wait for the kernel to finish running
-    CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
-
-    // The kernel ran successfully, so we get the results off the GPU
-    // Outputs come right after the inputs
-    // TODO: Do this differently (need to not do arithmetic on void pointer for it to be valid)
-    // Specifically, I know what the byte length should be in this buffer because the operation is specified
-    // Basically, we're completing the type manually for bindings compatibility reasons
-    // Otherwise we'd have to template(?) the streamData struct with the input, output, and constant types
-    // and cast the cpu and gpu buffers to the right structure depending on the operation.
-    // 
-    // For now, just instantiate with types for elgamal 4k?
-    // This is a mess. We should just be able to pass "elgamal" or, at worst, "elgamal<params4096>" 
-    // I'd rather not have to switch all the types and instantiate different classes based on the cryptop but that's a limitation on Cgo.
-    void *cpuOutputs, *gpuOutputs;
-    typedef typename cmixPrecomp<params4096>::mem_t mem_t;
-    switch (stream->whichToRun) {
-    case KERNEL_ELGAMAL:
-      cpuOutputs = getOutputs<cmixPrecomp<params4096>::elgamal_input_t, cmixPrecomp<params4096>::elgamal_constant_t>(stream->cpuMem, stream->length);
-      gpuOutputs = getOutputs<cmixPrecomp<params4096>::elgamal_input_t, cmixPrecomp<params4096>::elgamal_constant_t>(stream->gpuMem, stream->length);
-      break;
-    case KERNEL_POWM_ODD:
-      cpuOutputs = getOutputs<cmixPrecomp<params4096>::powm_odd_input_t, mem_t>(stream->cpuMem, stream->length);
-      gpuOutputs = getOutputs<cmixPrecomp<params4096>::powm_odd_input_t, mem_t>(stream->gpuMem, stream->length);
-      break;
-    case KERNEL_REVEAL:
-      cpuOutputs = getOutputs<mem_t, cmixPrecomp<params4096>::reveal_constant_t>(stream->cpuMem, stream->length);
-      gpuOutputs = getOutputs<mem_t, cmixPrecomp<params4096>::reveal_constant_t>(stream->gpuMem, stream->length);
-      break;
-    case KERNEL_STRIP:
-      cpuOutputs = getOutputs<cmixPrecomp<params4096>::strip_input_t, cmixPrecomp<params4096>::reveal_constant_t>(stream->cpuMem, stream->length);
-      gpuOutputs = getOutputs<cmixPrecomp<params4096>::strip_input_t, cmixPrecomp<params4096>::reveal_constant_t>(stream->gpuMem, stream->length);
-      break;
-    case KERNEL_MUL2:
-      cpuOutputs = getOutputs<cmixPrecomp<params4096>::mul2_input_t, mem_t>(stream->cpuMem, stream->length);
-      gpuOutputs = getOutputs<cmixPrecomp<params4096>::mul2_input_t, mem_t>(stream->gpuMem, stream->length);
-      break;
-    default:
-      return strdup("Unknown kernel for download; unable to find location of outputs in buffer\n");
-    }
-    CUDA_CHECK_RETURN(cudaMemcpyAsync(cpuOutputs, gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
-    CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
-
-    return NULL;
-  }
 
   const char* getResults(void *stream) {
     debugPrint("getResults (void)");
@@ -755,130 +987,10 @@ extern "C" {
     return NULL;
   }
 
-  // Return cpu inputs buffer pointer for writing
-  // TODO Implement depending on kernel/length
-  void* getCpuInputs(void* stream, enum kernel op) {
-    streamData* s = (streamData*)stream;
-    switch (op) {
-      case KERNEL_ELGAMAL:
-        return getInputs<cmixPrecomp<params4096>::elgamal_constant_t>(s->cpuMem);
-        break;
-      case KERNEL_POWM_ODD:
-      case KERNEL_MUL2:
-        return getInputs<cmixPrecomp<params4096>::mem_t>(s->cpuMem);
-        break;
-      case KERNEL_REVEAL:
-        return getInputs<cmixPrecomp<params4096>::reveal_constant_t>(s->cpuMem);
-        break;
-      case KERNEL_STRIP:
-        return getInputs<cmixPrecomp<params4096>::reveal_constant_t>(s->cpuMem);
-        break;
-      default:
-        // Unimplemented
-        return NULL;
-        break;
-    }
-  }
-
-  // Return cpu outputs buffer pointer for reading
-  void* getCpuOutputs(void* stream) {
-    streamData* s = (streamData*)stream;
-    switch (s->whichToRun) {
-      case KERNEL_ELGAMAL:
-        return getOutputs<cmixPrecomp<params4096>::elgamal_input_t, cmixPrecomp<params4096>::elgamal_constant_t>(
-            s->cpuMem, s->length);
-        break;
-      case KERNEL_POWM_ODD:
-        return getOutputs<cmixPrecomp<params4096>::powm_odd_input_t, cmixPrecomp<params4096>::mem_t>(
-            s->cpuMem, s->length);
-        break;
-      case KERNEL_REVEAL:
-        return getOutputs<cmixPrecomp<params4096>::mem_t, cmixPrecomp<params4096>::reveal_constant_t>(
-            s->cpuMem, s->length);
-        break;
-      case KERNEL_STRIP:
-        return getOutputs<cmixPrecomp<params4096>::strip_input_t, cmixPrecomp<params4096>::reveal_constant_t>(
-            s->cpuMem, s->length);
-        break;
-      case KERNEL_MUL2:
-        return getOutputs<cmixPrecomp<params4096>::mul2_input_t, cmixPrecomp<params4096>::mem_t>(
-            s->cpuMem, s->length);
-      default:
-        // Unimplemented
-        return NULL;
-        break;
-    }
-  }
 
   // Return cpu constants buffer pointer for writing
   void* getCpuConstants(void* stream) {
     return ((streamData*)stream)->cpuMem;
-  }
-
-  // TODO? Deprecate this and use sizeof / pointer arithmetic instead
-  //  Although, I think we might need this for slicing things on the go side
-  // TODO? Support different bit lengths
-  size_t getConstantsSize(enum kernel op) {
-    switch (op) {
-      case KERNEL_ELGAMAL:
-        return sizeof(cmixPrecomp<params4096>::elgamal_constant_t);
-        break;
-      case KERNEL_POWM_ODD:
-      case KERNEL_MUL2:
-        return sizeof(cmixPrecomp<params4096>::mem_t);
-        break;
-      case KERNEL_REVEAL:
-      case KERNEL_STRIP:
-        return sizeof(cmixPrecomp<params4096>::reveal_constant_t);
-        break;
-      default:
-        // Unimplemented
-        return 0;
-        break;
-    }
-  }
-
-  size_t getInputSize(enum kernel op) {
-    switch (op) {
-      case KERNEL_ELGAMAL:
-        return sizeof(cmixPrecomp<params4096>::elgamal_input_t);
-        break;
-      case KERNEL_POWM_ODD:
-        return sizeof(cmixPrecomp<params4096>::powm_odd_input_t);
-        break;
-      case KERNEL_REVEAL:
-        return sizeof(cmixPrecomp<params4096>::mem_t);
-        break;
-      case KERNEL_STRIP:
-        return sizeof(cmixPrecomp<params4096>::strip_input_t);
-        break;
-      case KERNEL_MUL2:
-        return sizeof(cmixPrecomp<params4096>::mul2_input_t);
-        break;
-      default:
-        // Unimplemented
-        return 0;
-        break;
-    }
-  }
-
-  size_t getOutputSize(enum kernel op) {
-    switch (op) {
-      case KERNEL_ELGAMAL:
-        return sizeof(cmixPrecomp<params4096>::elgamal_output_t);
-        break;
-      case KERNEL_POWM_ODD:
-      case KERNEL_REVEAL:
-      case KERNEL_STRIP:
-      case KERNEL_MUL2:
-        // Most ops just return one number
-        return sizeof(cmixPrecomp<params4096>::mem_t);
-        break;
-      default:
-        // Unimplemented
-        return 0;
-        break;
-    }
   }
 
 }
