@@ -914,6 +914,51 @@ extern "C" {
     return run<params2048>(stream);
   }
 
+  // Enqueue the specified kernel at 4k bits size
+  const char* enqueue4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    debugPrint("enqueue4096 (void)");
+    const char* err;
+    err = upload<params4096>(instance_count, stream, whichToRun);
+    if (err != NULL) {
+      return err;
+    }
+    err = run<params4096>(stream);
+    if (err != NULL) {
+      return err;
+    }
+    return download<params4096>(stream);
+  }
+
+  // Enqueue the specified kernel at 3k bits size
+  const char* enqueue3200(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    debugPrint("enqueue3200 (void)");
+    const char* err;
+    err = upload<params3200>(instance_count, stream, whichToRun);
+    if (err != NULL) {
+      return err;
+    }
+    err = run<params3200>(stream);
+    if (err != NULL) {
+      return err;
+    }
+    return download<params3200>(stream);
+  }
+
+  // Enqueue the specified kernel at 2k bits size
+  const char* enqueue2048(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    debugPrint("enqueue2048 (void)");
+    const char* err;
+    err = upload<params3200>(instance_count, stream, whichToRun);
+    if (err != NULL) {
+      return err;
+    }
+    err = run<params3200>(stream);
+    if (err != NULL) {
+      return err;
+    }
+    return download<params3200>(stream);
+  }
+
   // Run upload for the specified kernel and 4k bits size
   const char* upload4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
     debugPrint("upload4096 (void)");

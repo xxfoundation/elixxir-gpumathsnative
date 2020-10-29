@@ -32,8 +32,13 @@ enum kernel {
   KERNEL_REVEAL,
   KERNEL_STRIP,
   KERNEL_MUL2,
+  NUM_KERNELS,
 };
 
+// Enqueue a kernel (upload, run, download)
+const char* enqueue4096(const uint32_t instance_count, void *stream, enum kernel whichToRun);
+const char* enqueue3200(const uint32_t instance_count, void *stream, enum kernel whichToRun);
+const char* enqueue2048(const uint32_t instance_count, void *stream, enum kernel whichToRun);
 // Prepare a kernel run
 const char* upload4096(const uint32_t instance_count, void *stream, enum kernel whichToRun);
 const char* upload3200(const uint32_t instance_count, void *stream, enum kernel whichToRun);
