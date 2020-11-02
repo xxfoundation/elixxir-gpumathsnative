@@ -991,6 +991,7 @@ extern "C" {
     streamData *s = (streamData*)(malloc(sizeof(*s)));
     result->error = createStream(createInfo, s);
     result->result = s;
+    result->cpuBuf = s->cpuMem;
     return result;
   }
 

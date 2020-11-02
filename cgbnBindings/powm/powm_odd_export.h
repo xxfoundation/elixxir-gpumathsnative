@@ -21,6 +21,9 @@ struct return_data {
   // For instance, the upload result gets passed back to the kernel run 
   // method, and it shouldn't be modified or the kernel won't run correctly.
   void *result;
+  // Pointer to the CPU buffer of the stream
+  // Go needs this to read and write job results
+  void *cpuBuf;
   // Go should check and handle this like a normal Go error - return, handle,
   // or panic.
   const char *error;
