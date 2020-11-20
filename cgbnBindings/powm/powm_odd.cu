@@ -62,6 +62,9 @@ struct streamData {
 
   // Check for CGBN errors after kernel finishes using this
   cgbn_error_report_t *report;
+  // This event is used, along with deviceToHost, to determine the total run
+  // time of this launch, including upload, download, and execution
+  cudaEvent_t start;
   // Synchronize this event to wait for host to device transfer before kernel execution
   cudaEvent_t hostToDevice;
   // Synchronize this event to wait for kernel execution to finish before device to host transfer
@@ -550,12 +553,16 @@ const char* run(streamData *stream) {
   return NULL;
 }
 
-const char* getResults(streamData *stream) {
-  debugPrint("getResults (streamData)");
+const char* getResults(streamData *stream, float *elapsedTime) {
+  debugPrint("getResults (streamData, *float)");
+  // Initialize to 0 in case of failure
+  *elapsedTime = 0;
   // Wait for download to complete
   CUDA_CHECK_RETURN(cudaEventSynchronize(stream->deviceToHost));
   // Not sure if we can check the error report before this (e.g. in download function)
   CGBN_CHECK_RETURN(stream->report);
+  // If no errors so far, get duration
+  CUDA_CHECK_RETURN(cudaEventElapsedTime(elapsedTime, stream->start, stream->deviceToHost));
   return NULL;
 }
 
@@ -600,12 +607,16 @@ inline const char* createStream(streamCreateInfo createInfo, streamData* stream)
   CUDA_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
   CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuMem), createInfo.capacity, cudaHostAllocDefault));
 
+  // cudaEventBlockingSync also prevents 100% cpu usage when synchronizing on an event
+  // However, it may impact performance, so I turned it off for now(?)
+  CUDA_CHECK_RETURN(cudaEventCreate(&(stream->start)));
   // These events are created with timing disabled because it takes time 
   // to get the timing data, and we don't need it.
-  // cudaEventBlockingSync also prevents 100% cpu usage when synchronizing on an event
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->hostToDevice), cudaEventDisableTiming|cudaEventBlockingSync));
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->exec), cudaEventDisableTiming|cudaEventBlockingSync));
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->deviceToHost), cudaEventDisableTiming|cudaEventBlockingSync));
+  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->hostToDevice), cudaEventDisableTiming));
+  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->exec), cudaEventDisableTiming));
+  // Timing data is needed for the last event, because we need the duration of the launch
+  // to estimate how long to wait on the next launches
+  CUDA_CHECK_RETURN(cudaEventCreate(&(stream->deviceToHost)));
 
   return NULL;
 }
@@ -702,6 +713,9 @@ const char* upload(const uint32_t instance_count, void *stream, enum kernel whic
   gpuData->inputsLength = inputsUploadSize;
   gpuData->outputsLength = outputsDownloadSize;
   gpuData->whichToRun = whichToRun;
+
+  // Record starting time of this upload
+  CUDA_CHECK_RETURN(cudaEventRecord(gpuData->start, gpuData->stream));
 
   // Upload the inputs
   CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuMem, gpuData->cpuMem, gpuData->inputsLength,
@@ -827,6 +841,14 @@ void* getCpuOutputs(void* stream) {
   }
 }
 
+// Helper function to set CPU outputs region to zero
+// This will help the caller know when the kernel's done!
+template<class cgbnParams>
+void zeroCpuOutputs(void* stream, size_t len) {
+  void* outputs = getCpuOutputs<cgbnParams>(stream);
+  memset(outputs, 0, len);
+}
+
 
 // All the methods used in cgo should have extern "C" linkage to avoid
 // implementation-specific name mangling
@@ -922,10 +944,15 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
+    // memset output buffer to make it possible to monitor for results
     err = run<params4096>(stream);
     if (err != NULL) {
       return err;
     }
+    // Set cpu outputs before download is enqueued
+    // That way, there's no way the go side can look at the memory before it's been zeroed out
+    // Could this be what's breaking reveal??
+    //zeroCpuOutputs<params4096>(stream, instance_count * getOutputSize<params4096>(whichToRun));
     return download<params4096>(stream);
   }
 
@@ -941,6 +968,9 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
+    // Set cpu outputs before download is enqueued
+    // That way, there's no way the go side can look at the memory before it's been zeroed out
+    zeroCpuOutputs<params3200>(stream, instance_count * getOutputSize<params3200>(whichToRun));
     return download<params3200>(stream);
   }
 
@@ -948,15 +978,18 @@ extern "C" {
   const char* enqueue2048(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
     debugPrint("enqueue2048 (void)");
     const char* err;
-    err = upload<params3200>(instance_count, stream, whichToRun);
+    err = upload<params2048>(instance_count, stream, whichToRun);
     if (err != NULL) {
       return err;
     }
-    err = run<params3200>(stream);
+    err = run<params2048>(stream);
     if (err != NULL) {
       return err;
     }
-    return download<params3200>(stream);
+    // Set cpu outputs before download is enqueued
+    // That way, there's no way the go side can look at the memory before it's been zeroed out
+    zeroCpuOutputs<params2048>(stream, instance_count * getOutputSize<params2048>(whichToRun));
+    return download<params2048>(stream);
   }
 
   // Run upload for the specified kernel and 4k bits size
@@ -978,16 +1011,19 @@ extern "C" {
   }
   
 
-  const char* getResults(void *stream) {
+  // Returns error and elapsed time of the run in floating-point seconds
+  struct results_return_data* getResults(void *stream) {
     debugPrint("getResults (void)");
-    return getResults((streamData*)stream);
+    results_return_data* result = (results_return_data*)malloc(sizeof(*result));
+    result->error = getResults((streamData*)stream, &result->elapsedTime);
+    return result;
   }
 
   // Call this when starting the program to allocate resources
   // Returns stream or error
-  struct return_data* createStream(streamCreateInfo createInfo) {
+  struct stream_return_data* createStream(streamCreateInfo createInfo) {
     debugPrint("createStream (streamCreateInfo)");
-    return_data* result = (return_data*)malloc(sizeof(*result));
+    stream_return_data* result = (stream_return_data*)malloc(sizeof(*result));
     streamData *s = (streamData*)(malloc(sizeof(*s)));
     result->error = createStream(createInfo, s);
     result->result = s;

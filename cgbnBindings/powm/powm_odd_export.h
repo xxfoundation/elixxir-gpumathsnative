@@ -15,7 +15,7 @@ extern "C" {
 
 // This type works well when returning large chunks of data to Go
 // It's used for the exported bindings for kernel running and data upload
-struct return_data {
+struct stream_return_data {
   // It's difficult for Golang to interpret most of this data, so it should
   // be treated as read-only when the results are used, and unused otherwise.
   // For instance, the upload result gets passed back to the kernel run 
@@ -24,6 +24,14 @@ struct return_data {
   // Pointer to the CPU buffer of the stream
   // Go needs this to read and write job results
   void *cpuBuf;
+  // Go should check and handle this like a normal Go error - return, handle,
+  // or panic.
+  const char *error;
+};
+
+// Return from get_results error text and duration (floating-point number of milliseconds)
+struct results_return_data {
+  float elapsedTime;
   // Go should check and handle this like a normal Go error - return, handle,
   // or panic.
   const char *error;
@@ -55,7 +63,7 @@ const char* download4096(void *stream);
 const char* download3200(void *stream);
 const char* download2048(void *stream);
 // Wait for a results download to finish
-const char* getResults(void *stream);
+struct results_return_data* getResults(void *stream);
 
 struct streamCreateInfo {
   // How much memory is available for the stream to use?
@@ -65,7 +73,7 @@ struct streamCreateInfo {
 
 // Call this when starting the program to allocate resources
 // Returns pointer to stream and error
-struct return_data* createStream(struct streamCreateInfo createInfo);
+struct stream_return_data* createStream(struct streamCreateInfo createInfo);
 // Call this after you're done with the kernel to destroy resources
 // Returns error
 const char* destroyStream(void *destroyee);
