@@ -127,6 +127,12 @@ class cmixPrecomp {
   } mul2_input_t;
 
   typedef struct {
+    mem_t x;
+    mem_t y;
+    mem_t z;
+  } mul3_input_t;
+
+  typedef struct {
     mem_t privateKey; // Used to calculate both outputs 
     mem_t key; // Used to calculate ecrKeys output 
     mem_t ecrKeys; // Used to calculate ecrKeys output
@@ -458,7 +464,7 @@ __global__ void kernel_mul2(cgbn_error_report_t *report, typename cmixPrecomp<pa
     return;
 
   cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
-  typename cmixPrecomp<params>::bn_t  x, y, prime, result;
+  typename cmixPrecomp<params>::bn_t  x, y, prime;
 
   cgbn_load(po._env, x, &(inputs[instance].x));
   cgbn_load(po._env, y, &(inputs[instance].y));
@@ -466,10 +472,39 @@ __global__ void kernel_mul2(cgbn_error_report_t *report, typename cmixPrecomp<pa
 
   uint32_t np0 = cgbn_bn2mont(po._env, x, x, prime);
   cgbn_bn2mont(po._env, y, y, prime);
-  cgbn_mont_mul(po._env, result, x, y, prime, np0);
-  cgbn_mont2bn(po._env, result, result, prime, np0);
+  cgbn_mont_mul(po._env, x, x, y, prime, np0);
+  cgbn_mont2bn(po._env, x, x, prime, np0);
 
-  cgbn_store(po._env, &(outputs[instance]), result);
+  cgbn_store(po._env, &(outputs[instance]), x);
+}
+
+// Multiply x, y, and z mod prime
+template<class params>
+__global__ void kernel_mul3(cgbn_error_report_t *report, typename cmixPrecomp<params>::mem_t *constants, typename cmixPrecomp<params>::mul3_input_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
+  int32_t instance;
+
+  // decode an instance number from the blockIdx and threadIdx
+  instance=(blockIdx.x*blockDim.x + threadIdx.x)/params::TPI;
+  if(instance>=count)
+    return;
+
+  cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
+  typename cmixPrecomp<params>::bn_t  x, y, prime;
+
+  cgbn_load(po._env, x, &(inputs[instance].x));
+  cgbn_load(po._env, y, &(inputs[instance].y));
+  cgbn_load(po._env, prime, constants);
+
+  // Pattern: result stored in first non env param
+  uint32_t np0 = cgbn_bn2mont(po._env, x, x, prime);
+  cgbn_bn2mont(po._env, y, y, prime);
+  cgbn_mont_mul(po._env, x, x, y, prime, np0);
+  cgbn_load(po._env,y , &(inputs[instance].z));
+  cgbn_bn2mont(po._env, y, y, prime);
+  cgbn_mont_mul(po._env, x, x, y, prime, np0);
+  cgbn_mont2bn(po._env, x, x, prime, np0);
+
+  cgbn_store(po._env, &(outputs[instance]), x);
 }
 
 
@@ -540,6 +575,16 @@ const char* run(streamData *stream) {
       input_t *gpuInputs = (input_t*)(gpuConstants+1);
       mem_t *gpuOutputs = (mem_t*)(gpuInputs+stream->length);
       kernel_mul2<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
+          stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
+    }
+    break;
+  case KERNEL_MUL3:
+    {
+      typedef typename cmixPrecomp<params>::mul3_input_t input_t;
+      mem_t *gpuConstants = (mem_t*)(stream->gpuMem);
+      input_t *gpuInputs = (input_t*)(gpuConstants+1);
+      mem_t *gpuOutputs = (mem_t*)(gpuInputs+stream->length);
+      kernel_mul3<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
           stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
     }
     break;
@@ -632,6 +677,7 @@ size_t getConstantsSize(enum kernel op) {
       break;
     case KERNEL_POWM_ODD:
     case KERNEL_MUL2:
+    case KERNEL_MUL3:
       return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
       break;
     case KERNEL_REVEAL:
@@ -663,6 +709,9 @@ size_t getInputSize(enum kernel op) {
     case KERNEL_MUL2:
       return sizeof(typename cmixPrecomp<cgbnParams>::mul2_input_t);
       break;
+    case KERNEL_MUL3:
+      return sizeof(typename cmixPrecomp<cgbnParams>::mul3_input_t);
+      break;
     default:
       // Unimplemented
       return 0;
@@ -680,6 +729,7 @@ size_t getOutputSize(enum kernel op) {
     case KERNEL_REVEAL:
     case KERNEL_STRIP:
     case KERNEL_MUL2:
+    case KERNEL_MUL3:
       // Most ops just return one number
       return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
       break;
@@ -775,6 +825,10 @@ const char* download(void *s) {
     cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, mem_t>(stream->cpuMem, stream->length);
     gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, mem_t>(stream->gpuMem, stream->length);
     break;
+  case KERNEL_MUL3:
+    cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul3_input_t, mem_t>(stream->cpuMem, stream->length);
+    gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul3_input_t, mem_t>(stream->gpuMem, stream->length);
+    break;
   default:
     return strdup("Unknown kernel for download; unable to find location of outputs in buffer\n");
   }
@@ -795,6 +849,7 @@ void* getCpuInputs(void* stream, enum kernel op) {
       break;
     case KERNEL_POWM_ODD:
     case KERNEL_MUL2:
+    case KERNEL_MUL3:
       return getInputs<typename cmixPrecomp<cgbnParams>::mem_t>(s->cpuMem);
       break;
     case KERNEL_REVEAL:
@@ -834,6 +889,11 @@ void* getCpuOutputs(void* stream) {
     case KERNEL_MUL2:
       return getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, typename cmixPrecomp<cgbnParams>::mem_t>(
           s->cpuMem, s->length);
+      break;
+    case KERNEL_MUL3:
+      return getOutputs<typename cmixPrecomp<cgbnParams>::mul3_input_t, typename cmixPrecomp<cgbnParams>::mem_t>(
+          s->cpuMem, s->length);
+      break;
     default:
       // Unimplemented
       return NULL;

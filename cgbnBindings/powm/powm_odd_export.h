@@ -43,6 +43,7 @@ enum kernel {
   KERNEL_REVEAL,
   KERNEL_STRIP,
   KERNEL_MUL2,
+  KERNEL_MUL3,
   NUM_KERNELS,
 };
 
