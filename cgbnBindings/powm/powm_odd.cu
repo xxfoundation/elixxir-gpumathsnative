@@ -62,6 +62,9 @@ struct streamData {
 
   // Check for CGBN errors after kernel finishes using this
   cgbn_error_report_t *report;
+  // This event is used, along with deviceToHost, to determine the total run
+  // time of this launch, including upload, download, and execution
+  cudaEvent_t start;
   // Synchronize this event to wait for host to device transfer before kernel execution
   cudaEvent_t hostToDevice;
   // Synchronize this event to wait for kernel execution to finish before device to host transfer
@@ -122,6 +125,12 @@ class cmixPrecomp {
     mem_t x;
     mem_t y;
   } mul2_input_t;
+
+  typedef struct {
+    mem_t x;
+    mem_t y;
+    mem_t z;
+  } mul3_input_t;
 
   typedef struct {
     mem_t privateKey; // Used to calculate both outputs 
@@ -455,7 +464,7 @@ __global__ void kernel_mul2(cgbn_error_report_t *report, typename cmixPrecomp<pa
     return;
 
   cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
-  typename cmixPrecomp<params>::bn_t  x, y, prime, result;
+  typename cmixPrecomp<params>::bn_t  x, y, prime;
 
   cgbn_load(po._env, x, &(inputs[instance].x));
   cgbn_load(po._env, y, &(inputs[instance].y));
@@ -463,10 +472,39 @@ __global__ void kernel_mul2(cgbn_error_report_t *report, typename cmixPrecomp<pa
 
   uint32_t np0 = cgbn_bn2mont(po._env, x, x, prime);
   cgbn_bn2mont(po._env, y, y, prime);
-  cgbn_mont_mul(po._env, result, x, y, prime, np0);
-  cgbn_mont2bn(po._env, result, result, prime, np0);
+  cgbn_mont_mul(po._env, x, x, y, prime, np0);
+  cgbn_mont2bn(po._env, x, x, prime, np0);
 
-  cgbn_store(po._env, &(outputs[instance]), result);
+  cgbn_store(po._env, &(outputs[instance]), x);
+}
+
+// Multiply x, y, and z mod prime
+template<class params>
+__global__ void kernel_mul3(cgbn_error_report_t *report, typename cmixPrecomp<params>::mem_t *constants, typename cmixPrecomp<params>::mul3_input_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
+  int32_t instance;
+
+  // decode an instance number from the blockIdx and threadIdx
+  instance=(blockIdx.x*blockDim.x + threadIdx.x)/params::TPI;
+  if(instance>=count)
+    return;
+
+  cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
+  typename cmixPrecomp<params>::bn_t  x, y, prime;
+
+  cgbn_load(po._env, x, &(inputs[instance].x));
+  cgbn_load(po._env, y, &(inputs[instance].y));
+  cgbn_load(po._env, prime, constants);
+
+  // Pattern: result stored in first non env param
+  uint32_t np0 = cgbn_bn2mont(po._env, x, x, prime);
+  cgbn_bn2mont(po._env, y, y, prime);
+  cgbn_mont_mul(po._env, x, x, y, prime, np0);
+  cgbn_load(po._env,y , &(inputs[instance].z));
+  cgbn_bn2mont(po._env, y, y, prime);
+  cgbn_mont_mul(po._env, x, x, y, prime, np0);
+  cgbn_mont2bn(po._env, x, x, prime, np0);
+
+  cgbn_store(po._env, &(outputs[instance]), x);
 }
 
 
@@ -540,6 +578,16 @@ const char* run(streamData *stream) {
           stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
     }
     break;
+  case KERNEL_MUL3:
+    {
+      typedef typename cmixPrecomp<params>::mul3_input_t input_t;
+      mem_t *gpuConstants = (mem_t*)(stream->gpuMem);
+      input_t *gpuInputs = (input_t*)(gpuConstants+1);
+      mem_t *gpuOutputs = (mem_t*)(gpuInputs+stream->length);
+      kernel_mul3<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
+          stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
+    }
+    break;
   default:
     return strdup("Unknown kernel not implemented");
     break;
@@ -600,12 +648,16 @@ inline const char* createStream(streamCreateInfo createInfo, streamData* stream)
   CUDA_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
   CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuMem), createInfo.capacity, cudaHostAllocDefault));
 
+  // cudaEventBlockingSync also prevents 100% cpu usage when synchronizing on an event
+  // However, it may impact performance, so I turned it off for now(?)
+  CUDA_CHECK_RETURN(cudaEventCreate(&(stream->start)));
   // These events are created with timing disabled because it takes time 
   // to get the timing data, and we don't need it.
-  // cudaEventBlockingSync also prevents 100% cpu usage when synchronizing on an event
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->hostToDevice), cudaEventDisableTiming|cudaEventBlockingSync));
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->exec), cudaEventDisableTiming|cudaEventBlockingSync));
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->deviceToHost), cudaEventDisableTiming|cudaEventBlockingSync));
+  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->hostToDevice), cudaEventDisableTiming));
+  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->exec), cudaEventDisableTiming));
+  // Timing data is needed for the last event, because we need the duration of the launch
+  // to estimate how long to wait on the next launches
+  CUDA_CHECK_RETURN(cudaEventCreate(&(stream->deviceToHost)));
 
   return NULL;
 }
@@ -621,6 +673,7 @@ size_t getConstantsSize(enum kernel op) {
       break;
     case KERNEL_POWM_ODD:
     case KERNEL_MUL2:
+    case KERNEL_MUL3:
       return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
       break;
     case KERNEL_REVEAL:
@@ -652,6 +705,9 @@ size_t getInputSize(enum kernel op) {
     case KERNEL_MUL2:
       return sizeof(typename cmixPrecomp<cgbnParams>::mul2_input_t);
       break;
+    case KERNEL_MUL3:
+      return sizeof(typename cmixPrecomp<cgbnParams>::mul3_input_t);
+      break;
     default:
       // Unimplemented
       return 0;
@@ -669,6 +725,7 @@ size_t getOutputSize(enum kernel op) {
     case KERNEL_REVEAL:
     case KERNEL_STRIP:
     case KERNEL_MUL2:
+    case KERNEL_MUL3:
       // Most ops just return one number
       return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
       break;
@@ -702,6 +759,9 @@ const char* upload(const uint32_t instance_count, void *stream, enum kernel whic
   gpuData->inputsLength = inputsUploadSize;
   gpuData->outputsLength = outputsDownloadSize;
   gpuData->whichToRun = whichToRun;
+
+  // Record starting time of this upload
+  CUDA_CHECK_RETURN(cudaEventRecord(gpuData->start, gpuData->stream));
 
   // Upload the inputs
   CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuMem, gpuData->cpuMem, gpuData->inputsLength,
@@ -761,6 +821,10 @@ const char* download(void *s) {
     cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, mem_t>(stream->cpuMem, stream->length);
     gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, mem_t>(stream->gpuMem, stream->length);
     break;
+  case KERNEL_MUL3:
+    cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul3_input_t, mem_t>(stream->cpuMem, stream->length);
+    gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul3_input_t, mem_t>(stream->gpuMem, stream->length);
+    break;
   default:
     return strdup("Unknown kernel for download; unable to find location of outputs in buffer\n");
   }
@@ -771,7 +835,6 @@ const char* download(void *s) {
 }
 
 // Return cpu inputs buffer pointer for writing
-// TODO Implement depending on kernel/length
 template<class cgbnParams>
 void* getCpuInputs(void* stream, enum kernel op) {
   streamData* s = (streamData*)stream;
@@ -781,6 +844,7 @@ void* getCpuInputs(void* stream, enum kernel op) {
       break;
     case KERNEL_POWM_ODD:
     case KERNEL_MUL2:
+    case KERNEL_MUL3:
       return getInputs<typename cmixPrecomp<cgbnParams>::mem_t>(s->cpuMem);
       break;
     case KERNEL_REVEAL:
@@ -820,13 +884,17 @@ void* getCpuOutputs(void* stream) {
     case KERNEL_MUL2:
       return getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, typename cmixPrecomp<cgbnParams>::mem_t>(
           s->cpuMem, s->length);
+      break;
+    case KERNEL_MUL3:
+      return getOutputs<typename cmixPrecomp<cgbnParams>::mul3_input_t, typename cmixPrecomp<cgbnParams>::mem_t>(
+          s->cpuMem, s->length);
+      break;
     default:
       // Unimplemented
       return NULL;
       break;
   }
 }
-
 
 // All the methods used in cgo should have extern "C" linkage to avoid
 // implementation-specific name mangling
@@ -882,57 +950,53 @@ extern "C" {
     return getCpuInputs<params2048>(stream, op);
   }
 
-  // Enqueue download after kernel run
-  const char* download4096(void *s) {
-    debugPrint("download (void)");
-    return download<params4096>(s);
-  }
-  // Enqueue download after kernel run
-  const char* download3200(void *s) {
-    debugPrint("download (void)");
-    return download<params3200>(s);
-  }
-  // Enqueue download after kernel run
-  const char* download2048(void *s) {
-    debugPrint("download (void)");
-    return download<params2048>(s);
-  }
-
-  // Trigger run for 4096 bits
-  const char* run4096(void* stream) {
-    debugPrint("run4096 (void)");
-    return run<params4096>(stream);
-  }
-  // Trigger run for 3200 bits
-  const char* run3200(void* stream) {
-    debugPrint("run3200 (void)");
-    return run<params3200>(stream);
-  }
-  // Trigger run for 2048 bits
-  const char* run2048(void* stream) {
-    debugPrint("run2048 (void)");
-    return run<params2048>(stream);
+  // Enqueue the specified kernel at 4k bits size
+  const char* enqueue4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    debugPrint("enqueue4096 (void)");
+    const char* err;
+    err = upload<params4096>(instance_count, stream, whichToRun);
+    if (err != NULL) {
+      return err;
+    }
+    // memset output buffer to make it possible to monitor for results
+    err = run<params4096>(stream);
+    if (err != NULL) {
+      return err;
+    }
+    return download<params4096>(stream);
   }
 
-  // Run upload for the specified kernel and 4k bits size
-  const char* upload4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-    debugPrint("upload4096 (void)");
-    return upload<params4096>(instance_count, stream, whichToRun);
+  // Enqueue the specified kernel at 3k bits size
+  const char* enqueue3200(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    debugPrint("enqueue3200 (void)");
+    const char* err;
+    err = upload<params3200>(instance_count, stream, whichToRun);
+    if (err != NULL) {
+      return err;
+    }
+    err = run<params3200>(stream);
+    if (err != NULL) {
+      return err;
+    }
+    return download<params3200>(stream);
   }
 
-  // Run upload for the specified kernel and 3k bits size
-  const char* upload3200(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-    debugPrint("upload3200 (void)");
-    return upload<params3200>(instance_count, stream, whichToRun);
+  // Enqueue the specified kernel at 2k bits size
+  const char* enqueue2048(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    debugPrint("enqueue2048 (void)");
+    const char* err;
+    err = upload<params2048>(instance_count, stream, whichToRun);
+    if (err != NULL) {
+      return err;
+    }
+    err = run<params2048>(stream);
+    if (err != NULL) {
+      return err;
+    }
+    return download<params2048>(stream);
   }
 
-  // Run upload for the specified kernel and 2k bits size
-  const char* upload2048(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-    debugPrint("upload2048 (void)");
-    return upload<params2048>(instance_count, stream, whichToRun);
-  }
-  
-
+  // Returns error and elapsed time of the run in floating-point seconds
   const char* getResults(void *stream) {
     debugPrint("getResults (void)");
     return getResults((streamData*)stream);
@@ -940,12 +1004,13 @@ extern "C" {
 
   // Call this when starting the program to allocate resources
   // Returns stream or error
-  struct return_data* createStream(streamCreateInfo createInfo) {
+  struct stream_return_data* createStream(streamCreateInfo createInfo) {
     debugPrint("createStream (streamCreateInfo)");
-    return_data* result = (return_data*)malloc(sizeof(*result));
+    stream_return_data* result = (stream_return_data*)malloc(sizeof(*result));
     streamData *s = (streamData*)(malloc(sizeof(*s)));
     result->error = createStream(createInfo, s);
     result->result = s;
+    result->cpuBuf = s->cpuMem;
     return result;
   }
 
