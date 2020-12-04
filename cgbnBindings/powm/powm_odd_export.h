@@ -29,14 +29,6 @@ struct stream_return_data {
   const char *error;
 };
 
-// Return from get_results error text and duration (floating-point number of milliseconds)
-struct results_return_data {
-  float elapsedTime;
-  // Go should check and handle this like a normal Go error - return, handle,
-  // or panic.
-  const char *error;
-};
-
 enum kernel {
   KERNEL_POWM_ODD,
   KERNEL_ELGAMAL,
@@ -51,20 +43,8 @@ enum kernel {
 const char* enqueue4096(const uint32_t instance_count, void *stream, enum kernel whichToRun);
 const char* enqueue3200(const uint32_t instance_count, void *stream, enum kernel whichToRun);
 const char* enqueue2048(const uint32_t instance_count, void *stream, enum kernel whichToRun);
-// Prepare a kernel run
-const char* upload4096(const uint32_t instance_count, void *stream, enum kernel whichToRun);
-const char* upload3200(const uint32_t instance_count, void *stream, enum kernel whichToRun);
-const char* upload2048(const uint32_t instance_count, void *stream, enum kernel whichToRun);
-// Enqueue a kernel run
-const char* run4096(void *stream);
-const char* run3200(void *stream);
-const char* run2048(void *stream);
-// Enqueue download from a previous kernel launch
-const char* download4096(void *stream);
-const char* download3200(void *stream);
-const char* download2048(void *stream);
 // Wait for a results download to finish
-struct results_return_data* getResults(void *stream);
+const char* getResults(void *stream);
 
 struct streamCreateInfo {
   // How much memory is available for the stream to use?

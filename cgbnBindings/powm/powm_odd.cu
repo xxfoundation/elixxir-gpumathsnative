@@ -598,16 +598,12 @@ const char* run(streamData *stream) {
   return NULL;
 }
 
-const char* getResults(streamData *stream, float *elapsedTime) {
-  debugPrint("getResults (streamData, *float)");
-  // Initialize to 0 in case of failure
-  *elapsedTime = 0;
+const char* getResults(streamData *stream) {
+  debugPrint("getResults (streamData)");
   // Wait for download to complete
   CUDA_CHECK_RETURN(cudaEventSynchronize(stream->deviceToHost));
   // Not sure if we can check the error report before this (e.g. in download function)
   CGBN_CHECK_RETURN(stream->report);
-  // If no errors so far, get duration
-  CUDA_CHECK_RETURN(cudaEventElapsedTime(elapsedTime, stream->start, stream->deviceToHost));
   return NULL;
 }
 
@@ -839,7 +835,6 @@ const char* download(void *s) {
 }
 
 // Return cpu inputs buffer pointer for writing
-// TODO Implement depending on kernel/length
 template<class cgbnParams>
 void* getCpuInputs(void* stream, enum kernel op) {
   streamData* s = (streamData*)stream;
@@ -901,15 +896,6 @@ void* getCpuOutputs(void* stream) {
   }
 }
 
-// Helper function to set CPU outputs region to zero
-// This will help the caller know when the kernel's done!
-template<class cgbnParams>
-void zeroCpuOutputs(void* stream, size_t len) {
-  void* outputs = getCpuOutputs<cgbnParams>(stream);
-  memset(outputs, 0, len);
-}
-
-
 // All the methods used in cgo should have extern "C" linkage to avoid
 // implementation-specific name mangling
 // This makes them more straightforward to load from the shared object
@@ -964,38 +950,6 @@ extern "C" {
     return getCpuInputs<params2048>(stream, op);
   }
 
-  // Enqueue download after kernel run
-  const char* download4096(void *s) {
-    debugPrint("download (void)");
-    return download<params4096>(s);
-  }
-  // Enqueue download after kernel run
-  const char* download3200(void *s) {
-    debugPrint("download (void)");
-    return download<params3200>(s);
-  }
-  // Enqueue download after kernel run
-  const char* download2048(void *s) {
-    debugPrint("download (void)");
-    return download<params2048>(s);
-  }
-
-  // Trigger run for 4096 bits
-  const char* run4096(void* stream) {
-    debugPrint("run4096 (void)");
-    return run<params4096>(stream);
-  }
-  // Trigger run for 3200 bits
-  const char* run3200(void* stream) {
-    debugPrint("run3200 (void)");
-    return run<params3200>(stream);
-  }
-  // Trigger run for 2048 bits
-  const char* run2048(void* stream) {
-    debugPrint("run2048 (void)");
-    return run<params2048>(stream);
-  }
-
   // Enqueue the specified kernel at 4k bits size
   const char* enqueue4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
     debugPrint("enqueue4096 (void)");
@@ -1009,10 +963,6 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
-    // Set cpu outputs before download is enqueued
-    // That way, there's no way the go side can look at the memory before it's been zeroed out
-    // Could this be what's breaking reveal??
-    //zeroCpuOutputs<params4096>(stream, instance_count * getOutputSize<params4096>(whichToRun));
     return download<params4096>(stream);
   }
 
@@ -1028,9 +978,6 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
-    // Set cpu outputs before download is enqueued
-    // That way, there's no way the go side can look at the memory before it's been zeroed out
-    zeroCpuOutputs<params3200>(stream, instance_count * getOutputSize<params3200>(whichToRun));
     return download<params3200>(stream);
   }
 
@@ -1046,37 +993,13 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
-    // Set cpu outputs before download is enqueued
-    // That way, there's no way the go side can look at the memory before it's been zeroed out
-    zeroCpuOutputs<params2048>(stream, instance_count * getOutputSize<params2048>(whichToRun));
     return download<params2048>(stream);
   }
 
-  // Run upload for the specified kernel and 4k bits size
-  const char* upload4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-    debugPrint("upload4096 (void)");
-    return upload<params4096>(instance_count, stream, whichToRun);
-  }
-
-  // Run upload for the specified kernel and 3k bits size
-  const char* upload3200(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-    debugPrint("upload3200 (void)");
-    return upload<params3200>(instance_count, stream, whichToRun);
-  }
-
-  // Run upload for the specified kernel and 2k bits size
-  const char* upload2048(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-    debugPrint("upload2048 (void)");
-    return upload<params2048>(instance_count, stream, whichToRun);
-  }
-  
-
   // Returns error and elapsed time of the run in floating-point seconds
-  struct results_return_data* getResults(void *stream) {
+  const char* getResults(void *stream) {
     debugPrint("getResults (void)");
-    results_return_data* result = (results_return_data*)malloc(sizeof(*result));
-    result->error = getResults((streamData*)stream, &result->elapsedTime);
-    return result;
+    return getResults((streamData*)stream);
   }
 
   // Call this when starting the program to allocate resources
