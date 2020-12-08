@@ -15,15 +15,12 @@ extern "C" {
 
 // This type works well when returning large chunks of data to Go
 // It's used for the exported bindings for kernel running and data upload
-struct stream_return_data {
+struct return_data {
   // It's difficult for Golang to interpret most of this data, so it should
   // be treated as read-only when the results are used, and unused otherwise.
   // For instance, the upload result gets passed back to the kernel run 
   // method, and it shouldn't be modified or the kernel won't run correctly.
   void *result;
-  // Pointer to the CPU buffer of the stream
-  // Go needs this to read and write job results
-  void *cpuBuf;
   // Go should check and handle this like a normal Go error - return, handle,
   // or panic.
   const char *error;
@@ -35,14 +32,20 @@ enum kernel {
   KERNEL_REVEAL,
   KERNEL_STRIP,
   KERNEL_MUL2,
-  KERNEL_MUL3,
-  NUM_KERNELS,
 };
 
-// Enqueue a kernel (upload, run, download)
-const char* enqueue4096(const uint32_t instance_count, void *stream, enum kernel whichToRun);
-const char* enqueue3200(const uint32_t instance_count, void *stream, enum kernel whichToRun);
-const char* enqueue2048(const uint32_t instance_count, void *stream, enum kernel whichToRun);
+// Prepare a kernel run
+const char* upload4096(const uint32_t instance_count, void *stream, enum kernel whichToRun);
+const char* upload3200(const uint32_t instance_count, void *stream, enum kernel whichToRun);
+const char* upload2048(const uint32_t instance_count, void *stream, enum kernel whichToRun);
+// Enqueue a kernel run
+const char* run4096(void *stream);
+const char* run3200(void *stream);
+const char* run2048(void *stream);
+// Enqueue download from a previous kernel launch
+const char* download4096(void *stream);
+const char* download3200(void *stream);
+const char* download2048(void *stream);
 // Wait for a results download to finish
 const char* getResults(void *stream);
 
@@ -54,7 +57,7 @@ struct streamCreateInfo {
 
 // Call this when starting the program to allocate resources
 // Returns pointer to stream and error
-struct stream_return_data* createStream(struct streamCreateInfo createInfo);
+struct return_data* createStream(struct streamCreateInfo createInfo);
 // Call this after you're done with the kernel to destroy resources
 // Returns error
 const char* destroyStream(void *destroyee);
