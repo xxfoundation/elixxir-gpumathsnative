@@ -55,6 +55,9 @@ struct streamCreateInfo {
 // Call this when starting the program to allocate resources
 // Returns pointer to stream and error
 struct stream_return_data* createStream(struct streamCreateInfo createInfo);
+// Returns 1 if stream is OK, 0 otherwise
+int isStreamValid(void* stream);
+
 // Call this after you're done with the kernel to destroy resources
 // Returns error
 const char* destroyStream(void *destroyee);
