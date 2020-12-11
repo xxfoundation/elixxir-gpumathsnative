@@ -1007,7 +1007,17 @@ extern "C" {
   struct stream_return_data* createStream(streamCreateInfo createInfo) {
     debugPrint("createStream (streamCreateInfo)");
     stream_return_data* result = (stream_return_data*)malloc(sizeof(*result));
+    if (result == NULL) {
+      // Allocation failed, rest of method's not valid
+      return NULL;
+    }
     streamData *s = (streamData*)(malloc(sizeof(*s)));
+    if (s == NULL) {
+      // Allocation failed, rest of method's not valid
+      // Don't return error string as its allocation is likely to also fail
+      free((void*)result);
+      return NULL;
+    }
     result->error = createStream(createInfo, s);
     result->result = s;
     result->cpuBuf = s->cpuMem;
@@ -1024,26 +1034,77 @@ extern "C" {
     if (stream != NULL) {
       if (stream->gpuMem != NULL) {
         CUDA_CHECK_RETURN(cudaFree(stream->gpuMem));
+        // Setting to NULL prevents double free if destroyStream is called twice for some reason
+        // This shouldn't happen
+        stream->gpuMem = NULL;
       }
       if (stream->cpuMem != NULL) {
         CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuMem));
+        stream->cpuMem = NULL;
       }
       if (stream->report != NULL) {
         CUDA_CHECK_RETURN(cgbn_error_report_free(stream->report));
+        stream->report = NULL;
+      }
+      if (stream->start != NULL) {
+        CUDA_CHECK_RETURN(cudaEventDestroy(stream->start));
+        stream->start = NULL;
       }
       if (stream->hostToDevice != NULL) {
         CUDA_CHECK_RETURN(cudaEventDestroy(stream->hostToDevice));
+        stream->hostToDevice = NULL;
       }
       if (stream->exec != NULL) {
         CUDA_CHECK_RETURN(cudaEventDestroy(stream->exec));
+        stream->exec = NULL;
       }
       if (stream->deviceToHost != NULL) {
         CUDA_CHECK_RETURN(cudaEventDestroy(stream->deviceToHost));
+        stream->deviceToHost = NULL;
       }
       free((void*)stream);
     }
 
     return NULL;
+  }
+
+#define FALSE 0
+#define TRUE 1
+  // Return true if passed stream has all fields that should be populated after
+  // initialization populated
+  int isStreamValid(void* stream) {
+    if (stream == NULL) {
+      return FALSE;
+    }
+    auto s = (streamData*)stream;
+    if (s->stream == NULL) {
+      return FALSE;
+    }
+    if (s->gpuMem == NULL) {
+      return FALSE;
+    }
+    if (s->cpuMem == NULL) {
+      return FALSE;
+    }
+    if (s->report == NULL) {
+      return FALSE;
+    }
+    if (s->start == NULL) {
+      return FALSE;
+    }
+    if (s->hostToDevice == NULL) {
+      return FALSE;
+    }
+    if (s->exec == NULL) {
+      return FALSE;
+    }
+    if (s->deviceToHost == NULL) {
+      return FALSE;
+    }
+    if (s->memCapacity == 0) {
+      return FALSE;
+    }
+    return TRUE;
   }
 
   // Call this after execution has completed to write out profile information to the disk
