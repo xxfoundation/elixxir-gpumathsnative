@@ -22,10 +22,14 @@ IN THE SOFTWARE.
 
 ***/
 
-cudaError_t cgbn_error_report_alloc(cgbn_error_report_t **report) {
-  cudaError_t status;
+CUresult cgbn_error_report_alloc(cgbn_error_report_t **report) {
+  CUresult status;
 
-  status=cudaMallocManaged((void **)report, sizeof(cgbn_error_report_t));
+  //status=cudaMallocManaged((void **)report, sizeof(cgbn_error_report_t));
+  status=cuMemAllocManaged(
+      (CUdeviceptr *)report,
+      sizeof(cgbn_error_report_t),
+      CU_MEM_ATTACH_GLOBAL);
   if(status!=0)
     return status;
   (*report)->_error=cgbn_no_error;
@@ -39,8 +43,8 @@ cudaError_t cgbn_error_report_alloc(cgbn_error_report_t **report) {
   return status;
 }
 
-cudaError_t cgbn_error_report_free(cgbn_error_report_t *report) {
-  return cudaFree(report);
+CUresult cgbn_error_report_free(cgbn_error_report_t *report) {
+  return cuMemFree((CUdeviceptr)report);
 }
 
 bool cgbn_error_report_check(cgbn_error_report_t *report) {

@@ -37,14 +37,14 @@ IN THE SOFTWARE.
 struct streamData {
   // This CUDA stream; when performing operations, set the current stream to
   // this one
-  cudaStream_t stream;
+  CUstream stream;
 
   // Area of device memory that this stream can use
-  void *gpuMem;
+  CUdeviceptr gpuMem;
   
   // Area of host memory that this stream can use
   // This buffer is pinned memory
-  void *cpuMem;
+  void* cpuMem;
 
   // Total size of buffers at max capacity (set at creation time)
   size_t memCapacity;
@@ -64,13 +64,13 @@ struct streamData {
   cgbn_error_report_t *report;
   // This event is used, along with deviceToHost, to determine the total run
   // time of this launch, including upload, download, and execution
-  cudaEvent_t start;
+  CUevent start;
   // Synchronize this event to wait for host to device transfer before kernel execution
-  cudaEvent_t hostToDevice;
+  CUevent hostToDevice;
   // Synchronize this event to wait for kernel execution to finish before device to host transfer
-  cudaEvent_t exec;
+  CUevent exec;
   // Synchronize this event to wait for downloading to finish before using results
-  cudaEvent_t deviceToHost;
+  CUevent deviceToHost;
 };
 
 // For this example, there are quite a few template parameters that are used to generate the actual code.
@@ -512,13 +512,14 @@ __global__ void kernel_mul3(cgbn_error_report_t *report, typename cmixPrecomp<pa
 // Enqueues kernel on the stream and returns immediately (non-blocking)
 // The results will be placed in the stream's gpu outputs buffer some time after the kernel launch
 // Precondition: stream should have had upload called on it
+// We need to invoke kernels using the cuda driver API, which is a little more complicated
 template<class params>
 const char* run(streamData *stream) {
   debugPrint("run (streamData, kernel)");
   const int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
 
-  CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->hostToDevice, 0));
+  CU_CHECK_RETURN(cuStreamWaitEvent(stream->stream, stream->hostToDevice, 0));
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
   // TODO We should be able to launch more than just this kernel.
   //  Organize with enumeration? Is it possible to use templates to make this better?
@@ -576,6 +577,9 @@ const char* run(streamData *stream) {
       mem_t *gpuOutputs = (mem_t*)(gpuInputs+stream->length);
       kernel_mul2<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
           stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
+      // Try getting CUDA error here? Maybe not getting what I want here
+      // Yeah - initialization error!
+      CUDA_CHECK_RETURN(cudaPeekAtLastError());
     }
     break;
   case KERNEL_MUL3:
@@ -593,7 +597,7 @@ const char* run(streamData *stream) {
     break;
   }
 
-  CUDA_CHECK_RETURN(cudaEventRecord(stream->exec, stream->stream));
+  CU_CHECK_RETURN(cuEventRecord(stream->exec, stream->stream));
 
   return NULL;
 }
@@ -601,8 +605,9 @@ const char* run(streamData *stream) {
 const char* getResults(streamData *stream) {
   debugPrint("getResults (streamData)");
   // Wait for download to complete
-  CUDA_CHECK_RETURN(cudaEventSynchronize(stream->deviceToHost));
+  CU_CHECK_RETURN(cuEventSynchronize(stream->deviceToHost));
   // Not sure if we can check the error report before this (e.g. in download function)
+  // Could CGBN errors potentially not get returned if stream->deviceToHost doesn't get recorded for some reason?
   CGBN_CHECK_RETURN(stream->report);
   return NULL;
 }
@@ -622,6 +627,19 @@ void* getOutputs(void* mem, size_t numItems) {
   return (void*) (inputs+numItems);
 }
 
+template <class Input, class Constant>
+CUdeviceptr getOutputs(CUdeviceptr mem, size_t numItems) {
+  debugPrint("getOutputs (CUdeviceptr, size_t)");
+  // We want to get the location after the inputs and constants
+  // Order doesn't matter and we assume padding doesn't exist
+  // (which should be true if the big numbers are big enough)
+  // Does this cast work OK?
+  Constant* constants = (Constant*)mem;
+  // Not sure if this is undefined behaviour? Do I have to reinterpret_cast or cast to void to make this work?
+  Input* inputs = (Input*)(constants+1);
+  return (CUdeviceptr) (inputs+numItems);
+}
+
 // Get the memory address of the beginning of the inputs in a buffer
 // Inputs always come right after constants
 template <class Constant>
@@ -636,31 +654,8 @@ typedef powm_params_t<32, 4096, 5> params4096;
 typedef powm_params_t<32, 3200, 5> params3200;
 typedef powm_params_t<32, 2048, 5> params2048;
 
-// create a bunch of streams and buffers suitable for running a particular kernel
-inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
-  debugPrint("createStream (streamData)");
-  stream->memCapacity = createInfo.capacity;
-  stream->length = 0;
-  stream->outputsLength = 0;
-  stream->inputsLength = 0;
-  CUDA_CHECK_RETURN(cudaStreamCreate(&(stream->stream)));
-  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuMem), createInfo.capacity));
-  CUDA_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
-  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuMem), createInfo.capacity, cudaHostAllocDefault));
+CUcontext cuContext;
 
-  // cudaEventBlockingSync also prevents 100% cpu usage when synchronizing on an event
-  // However, it may impact performance, so I turned it off for now(?)
-  CUDA_CHECK_RETURN(cudaEventCreate(&(stream->start)));
-  // These events are created with timing disabled because it takes time 
-  // to get the timing data, and we don't need it.
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->hostToDevice), cudaEventDisableTiming));
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->exec), cudaEventDisableTiming));
-  // Timing data is needed for the last event, because we need the duration of the launch
-  // to estimate how long to wait on the next launches
-  CUDA_CHECK_RETURN(cudaEventCreate(&(stream->deviceToHost)));
-
-  return NULL;
-}
 
 // TODO? Deprecate this and use sizeof / pointer arithmetic instead
 //  Although, I think we might need this for slicing things on the go side
@@ -742,7 +737,7 @@ template<class cgbnParams>
 const char* upload(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
   auto gpuData = (streamData*)stream;
   // Previous download must finish before data are uploaded
-  CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
+  CU_CHECK_RETURN(cuStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
   
   // Set instance count; it's re-used when the kernel gets run later
   gpuData->length = instance_count;
@@ -761,15 +756,14 @@ const char* upload(const uint32_t instance_count, void *stream, enum kernel whic
   gpuData->whichToRun = whichToRun;
 
   // Record starting time of this upload
-  CUDA_CHECK_RETURN(cudaEventRecord(gpuData->start, gpuData->stream));
+  CU_CHECK_RETURN(cuEventRecord(gpuData->start, gpuData->stream));
 
   // Upload the inputs
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuMem, gpuData->cpuMem, gpuData->inputsLength,
-        cudaMemcpyHostToDevice, gpuData->stream));
+  CU_CHECK_RETURN(cuMemcpyHtoDAsync(gpuData->gpuMem, gpuData->cpuMem, gpuData->inputsLength, gpuData->stream));
 
   // Run should wait on this event for kernel launch
   // The event should include any memcpys that haven't completed yet
-  CUDA_CHECK_RETURN(cudaEventRecord(gpuData->hostToDevice, gpuData->stream));
+  CU_CHECK_RETURN(cuEventRecord(gpuData->hostToDevice, gpuData->stream));
 
   return NULL;
 }
@@ -785,7 +779,7 @@ template<class cgbnParams>
 const char* download(void *s) {
   auto stream = (streamData*)s;
   // Wait for the kernel to finish running
-  CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
+  CU_CHECK_RETURN(cuStreamWaitEvent(stream->stream, stream->exec, 0));
 
   // The kernel ran successfully, so we get the results off the GPU
   // Outputs come right after the inputs
@@ -798,7 +792,8 @@ const char* download(void *s) {
   // For now, just instantiate with types for elgamal 4k?
   // This is a mess. We should just be able to pass "elgamal" or, at worst, "elgamal<params4096>" 
   // I'd rather not have to switch all the types and instantiate different classes based on the cryptop but that's a limitation on Cgo.
-  void *cpuOutputs, *gpuOutputs;
+  void *cpuOutputs;
+  CUdeviceptr gpuOutputs;
   typedef typename cmixPrecomp<cgbnParams>::mem_t mem_t;
   switch (stream->whichToRun) {
   case KERNEL_ELGAMAL:
@@ -828,8 +823,8 @@ const char* download(void *s) {
   default:
     return strdup("Unknown kernel for download; unable to find location of outputs in buffer\n");
   }
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(cpuOutputs, gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
-  CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
+  CU_CHECK_RETURN(cuMemcpyDtoHAsync(cpuOutputs, gpuOutputs, stream->outputsLength, stream->stream));
+  CU_CHECK_RETURN(cuEventRecord(stream->deviceToHost, stream->stream));
 
   return NULL;
 }
@@ -895,6 +890,29 @@ void* getCpuOutputs(void* stream) {
       break;
   }
 }
+
+// create a bunch of streams and buffers suitable for running a particular kernel
+inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
+  debugPrint("createStream (streamData)");
+  stream->memCapacity = createInfo.capacity;
+  stream->length = 0;
+  stream->outputsLength = 0;
+  stream->inputsLength = 0;
+  CU_CHECK_RETURN(cuStreamCreate(&(stream->stream), CU_STREAM_DEFAULT));
+  CU_CHECK_RETURN(cuMemAlloc(&(stream->gpuMem), createInfo.capacity));
+  CU_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
+  CU_CHECK_RETURN(cuMemAllocHost(&(stream->cpuMem), createInfo.capacity));
+
+  // cudaEventBlockingSync prevents 100% cpu usage when synchronizing on an event
+  // However, it may impact performance, so I turned it off for now(?)
+  CU_CHECK_RETURN(cuEventCreate(&stream->start, CU_EVENT_DISABLE_TIMING));
+  CU_CHECK_RETURN(cuEventCreate(&stream->hostToDevice, CU_EVENT_DISABLE_TIMING));
+  CU_CHECK_RETURN(cuEventCreate(&stream->exec, CU_EVENT_DISABLE_TIMING));
+  CU_CHECK_RETURN(cuEventCreate(&stream->deviceToHost, CU_EVENT_DISABLE_TIMING));
+
+  return NULL;
+}
+
 
 // All the methods used in cgo should have extern "C" linkage to avoid
 // implementation-specific name mangling
@@ -1032,34 +1050,34 @@ extern "C" {
     // Don't know at what point there could have been errors while creating this stream,
     // so make sure things exist before destroying them
     if (stream != NULL) {
-      if (stream->gpuMem != NULL) {
-        CUDA_CHECK_RETURN(cudaFree(stream->gpuMem));
-        // Setting to NULL prevents double free if destroyStream is called twice for some reason
+      if (stream->gpuMem != 0) {
+        CU_CHECK_RETURN(cuMemFree(stream->gpuMem));
+        // Setting to null prevents double free if destroyStream is called twice for some reason
         // This shouldn't happen
-        stream->gpuMem = NULL;
+        stream->gpuMem = 0;
       }
       if (stream->cpuMem != NULL) {
-        CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuMem));
+        CU_CHECK_RETURN(cuMemFreeHost(stream->cpuMem));
         stream->cpuMem = NULL;
       }
       if (stream->report != NULL) {
-        CUDA_CHECK_RETURN(cgbn_error_report_free(stream->report));
+        CU_CHECK_RETURN(cgbn_error_report_free(stream->report));
         stream->report = NULL;
       }
       if (stream->start != NULL) {
-        CUDA_CHECK_RETURN(cudaEventDestroy(stream->start));
+        CU_CHECK_RETURN(cuEventDestroy(stream->start));
         stream->start = NULL;
       }
       if (stream->hostToDevice != NULL) {
-        CUDA_CHECK_RETURN(cudaEventDestroy(stream->hostToDevice));
+        CU_CHECK_RETURN(cuEventDestroy(stream->hostToDevice));
         stream->hostToDevice = NULL;
       }
       if (stream->exec != NULL) {
-        CUDA_CHECK_RETURN(cudaEventDestroy(stream->exec));
+        CU_CHECK_RETURN(cuEventDestroy(stream->exec));
         stream->exec = NULL;
       }
       if (stream->deviceToHost != NULL) {
-        CUDA_CHECK_RETURN(cudaEventDestroy(stream->deviceToHost));
+        CU_CHECK_RETURN(cuEventDestroy(stream->deviceToHost));
         stream->deviceToHost = NULL;
       }
       free((void*)stream);
@@ -1080,7 +1098,7 @@ extern "C" {
     if (s->stream == NULL) {
       return FALSE;
     }
-    if (s->gpuMem == NULL) {
+    if (s->gpuMem == 0) {
       return FALSE;
     }
     if (s->cpuMem == NULL) {
@@ -1108,16 +1126,48 @@ extern "C" {
   }
 
   // Call this after execution has completed to write out profile information to the disk
+  // TODO This is currently unused. It either needs to take a "device" param or that and a context param
+  // See driver API 5.8, context management modules
+  // Commenting out for now
+  /*
   const char* resetDevice() {
-    CUDA_CHECK_RETURN(cudaDeviceReset());
+    CU_CHECK_RETURN(cuDevicePrimaryCtxReset(device));
     return NULL;
   }
+  */
 
 
   // Return cpu constants buffer pointer for writing
   void* getCpuConstants(void* stream) {
     return ((streamData*)stream)->cpuMem;
   }
+
+  // Eventually: one context per device?
+  // You must call this before any other calls that call cuda
+  const char* createContext() {
+    CU_CHECK_RETURN(cuInit(0));
+    // count available devices
+    int deviceCount = 0;
+    CU_CHECK_RETURN(cuDeviceGetCount(&deviceCount));
+    
+    if (deviceCount == 0) {
+      return strdup("no CUDA devices available. are drivers installed? try running node with useGPU:false");
+    }
+
+    // try first device, which should work if we made it here
+    int dev = 0;
+    int cuDevice = 0;
+    CU_CHECK_RETURN(cuDeviceGet(&cuDevice, dev));
+    // Don't worry right now about CU_COMPUTEMODE_PROHIBITED
+
+    // initialize context on the device we chose
+    CU_CHECK_RETURN(cuCtxCreate(&cuContext, 0, cuDevice));
+    // Samples have a global cuContext, that'd probably be fine for now...
+    // TODO destroy context later
+    // TODO load appropriate kernels for this device from fatbin native library
+    return NULL;
+  }
+
 
 }
 

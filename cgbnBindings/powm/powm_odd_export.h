@@ -58,6 +58,9 @@ struct stream_return_data* createStream(struct streamCreateInfo createInfo);
 // Returns 1 if stream is OK, 0 otherwise
 int isStreamValid(void* stream);
 
+// TODO reliably fail this under mem pressure
+const char* createContext();
+
 // Call this after you're done with the kernel to destroy resources
 // Returns error
 const char* destroyStream(void *destroyee);
