@@ -33,7 +33,6 @@ enum kernel {
   KERNEL_POWM_ODD,
   KERNEL_ELGAMAL,
   KERNEL_REVEAL,
-  KERNEL_STRIP,
   KERNEL_MUL2,
   KERNEL_MUL3,
   NUM_KERNELS,
@@ -57,6 +56,9 @@ struct streamCreateInfo {
 struct stream_return_data* createStream(struct streamCreateInfo createInfo);
 // Returns 1 if stream is OK, 0 otherwise
 int isStreamValid(void* stream);
+
+// TODO reliably fail this under mem pressure
+const char* initCuda();
 
 // Call this after you're done with the kernel to destroy resources
 // Returns error
