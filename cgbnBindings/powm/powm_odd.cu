@@ -930,7 +930,7 @@ inline const char* createStream(streamCreateInfo createInfo, streamData* stream)
   CU_CHECK_RETURN(cuEventCreate(&stream->hostToDevice, CU_EVENT_DISABLE_TIMING));
   CU_CHECK_RETURN(cuEventCreate(&stream->exec, CU_EVENT_DISABLE_TIMING));
   CU_CHECK_RETURN(cuEventCreate(&stream->deviceToHost, CU_EVENT_DISABLE_TIMING));
-  CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
+  CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
 
   return NULL;
 }
@@ -1004,7 +1004,7 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
-    CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
+    CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
     return download<params4096>(stream);
   }
 
@@ -1021,7 +1021,7 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
-    CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
+    CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
     return download<params3200>(stream);
   }
 
@@ -1038,7 +1038,7 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
-    CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
+    CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
     return download<params2048>(stream);
   }
 
@@ -1111,7 +1111,7 @@ extern "C" {
       }
       free((void*)stream);
     }
-    CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
+    CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
 
     return NULL;
   }
@@ -1200,6 +1200,7 @@ extern "C" {
       CU_CHECK_RETURN(cuModuleGetFunction(&powm_2048_function, cuModule, "powm_2048"));
       return NULL;
     }
+    return NULL;
   }
 
 
