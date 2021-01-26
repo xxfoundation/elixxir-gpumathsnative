@@ -913,6 +913,7 @@ void* getCpuOutputs(void* stream) {
 
 // create a bunch of streams and buffers suitable for running a particular kernel
 inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
+  CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
   debugPrint("createStream (streamData)");
   stream->memCapacity = createInfo.capacity;
   stream->length = 0;
@@ -929,6 +930,7 @@ inline const char* createStream(streamCreateInfo createInfo, streamData* stream)
   CU_CHECK_RETURN(cuEventCreate(&stream->hostToDevice, CU_EVENT_DISABLE_TIMING));
   CU_CHECK_RETURN(cuEventCreate(&stream->exec, CU_EVENT_DISABLE_TIMING));
   CU_CHECK_RETURN(cuEventCreate(&stream->deviceToHost, CU_EVENT_DISABLE_TIMING));
+  CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
 
   return NULL;
 }
@@ -990,6 +992,7 @@ extern "C" {
 
   // Enqueue the specified kernel at 4k bits size
   const char* enqueue4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
     debugPrint("enqueue4096 (void)");
     const char* err;
     err = upload<params4096>(instance_count, stream, whichToRun);
@@ -1001,11 +1004,13 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
+    CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
     return download<params4096>(stream);
   }
 
   // Enqueue the specified kernel at 3k bits size
   const char* enqueue3200(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
     debugPrint("enqueue3200 (void)");
     const char* err;
     err = upload<params3200>(instance_count, stream, whichToRun);
@@ -1016,11 +1021,13 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
+    CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
     return download<params3200>(stream);
   }
 
   // Enqueue the specified kernel at 2k bits size
   const char* enqueue2048(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
     debugPrint("enqueue2048 (void)");
     const char* err;
     err = upload<params2048>(instance_count, stream, whichToRun);
@@ -1031,6 +1038,7 @@ extern "C" {
     if (err != NULL) {
       return err;
     }
+    CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
     return download<params2048>(stream);
   }
 
@@ -1069,6 +1077,7 @@ extern "C" {
     auto stream = (streamData*)destroyee;
     // Don't know at what point there could have been errors while creating this stream,
     // so make sure things exist before destroying them
+    CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
     if (stream != NULL) {
       if (stream->gpuMem != 0) {
         CU_CHECK_RETURN(cuMemFree(stream->gpuMem));
@@ -1102,6 +1111,7 @@ extern "C" {
       }
       free((void*)stream);
     }
+    CU_CHECK_RETURN(cuCtxPopCurrent(cuContext));
 
     return NULL;
   }
@@ -1145,18 +1155,6 @@ extern "C" {
     return TRUE;
   }
 
-  // Call this after execution has completed to write out profile information to the disk
-  // TODO This is currently unused. It either needs to take a "device" param or that and a context param
-  // See driver API 5.8, context management modules
-  // Commenting out for now
-  /*
-  const char* resetDevice() {
-    CU_CHECK_RETURN(cuDevicePrimaryCtxReset(device));
-    return NULL;
-  }
-  */
-
-
   // Return cpu constants buffer pointer for writing
   void* getCpuConstants(void* stream) {
     return ((streamData*)stream)->cpuMem;
@@ -1165,41 +1163,43 @@ extern "C" {
   // Eventually: one context per device?
   // You must call this before any other calls that call cuda
   const char* initCuda() {
-    CU_CHECK_RETURN(cuInit(0));
-    // count available devices
-    int deviceCount = 0;
-    CU_CHECK_RETURN(cuDeviceGetCount(&deviceCount));
-    
-    if (deviceCount == 0) {
-      return strdup("no CUDA devices available. are drivers installed? try running node with useGPU:false");
+    if (cuContext == NULL) {
+      CU_CHECK_RETURN(cuInit(0));
+      // count available devices
+      int deviceCount = 0;
+      CU_CHECK_RETURN(cuDeviceGetCount(&deviceCount));
+      
+      if (deviceCount == 0) {
+        return strdup("no CUDA devices available. are drivers installed? try running node with useGPU:false");
+      }
+
+      // try first device, which should work if we made it here
+      // TODO implement explicit device selection
+      int dev = 0;
+      int cuDevice = 0;
+      CU_CHECK_RETURN(cuDeviceGet(&cuDevice, dev));
+
+      // initialize context on the device we chose
+      CU_CHECK_RETURN(cuCtxCreate(&cuContext, 0, cuDevice));
+      // Samples have a global cuContext, so that's probably fine for now...
+      CU_CHECK_RETURN(cuModuleLoad(&cuModule, "/opt/xxnetwork/lib/libpow.fatbin"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul2_4096_function, cuModule, "mul2_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul3_4096_function, cuModule, "mul3_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&elgamal_4096_function, cuModule, "elgamal_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&reveal_4096_function, cuModule, "reveal_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&powm_4096_function, cuModule, "powm_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul2_3200_function, cuModule, "mul2_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul3_3200_function, cuModule, "mul3_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&elgamal_3200_function, cuModule, "elgamal_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&reveal_3200_function, cuModule, "reveal_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&powm_3200_function, cuModule, "powm_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul2_2048_function, cuModule, "mul2_2048"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul3_2048_function, cuModule, "mul3_2048"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&elgamal_2048_function, cuModule, "elgamal_2048"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&reveal_2048_function, cuModule, "reveal_2048"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&powm_2048_function, cuModule, "powm_2048"));
+      return NULL;
     }
-
-    // try first device, which should work if we made it here
-    // TODO implement explicit device selection
-    int dev = 0;
-    int cuDevice = 0;
-    CU_CHECK_RETURN(cuDeviceGet(&cuDevice, dev));
-
-    // initialize context on the device we chose
-    CU_CHECK_RETURN(cuCtxCreate(&cuContext, 0, cuDevice));
-    // Samples have a global cuContext, so that's probably fine for now...
-    CU_CHECK_RETURN(cuModuleLoad(&cuModule, "/opt/xxnetwork/lib/libpow.fatbin"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&mul2_4096_function, cuModule, "mul2_4096"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&mul3_4096_function, cuModule, "mul3_4096"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&elgamal_4096_function, cuModule, "elgamal_4096"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&reveal_4096_function, cuModule, "reveal_4096"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&powm_4096_function, cuModule, "powm_4096"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&mul2_3200_function, cuModule, "mul2_3200"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&mul3_3200_function, cuModule, "mul3_3200"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&elgamal_3200_function, cuModule, "elgamal_3200"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&reveal_3200_function, cuModule, "reveal_3200"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&powm_3200_function, cuModule, "powm_3200"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&mul2_2048_function, cuModule, "mul2_2048"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&mul3_2048_function, cuModule, "mul3_2048"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&elgamal_2048_function, cuModule, "elgamal_2048"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&reveal_2048_function, cuModule, "reveal_2048"));
-    CU_CHECK_RETURN(cuModuleGetFunction(&powm_2048_function, cuModule, "powm_2048"));
-    return NULL;
   }
 
 
