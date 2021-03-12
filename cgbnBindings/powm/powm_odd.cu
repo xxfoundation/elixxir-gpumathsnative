@@ -32,19 +32,39 @@ IN THE SOFTWARE.
 #include "../utility/support.h"
 #include "powm_odd_export.h"
 
+// Driver API definitions
+// TODO structure this all some more perhaps
+CUcontext cuContext;
+CUmodule cuModule;
+CUfunction powm_4096_function;
+CUfunction powm_3200_function;
+CUfunction powm_2048_function;
+CUfunction elgamal_4096_function;
+CUfunction elgamal_3200_function;
+CUfunction elgamal_2048_function;
+CUfunction reveal_4096_function;
+CUfunction reveal_3200_function;
+CUfunction reveal_2048_function;
+CUfunction mul2_4096_function;
+CUfunction mul2_3200_function;
+CUfunction mul2_2048_function;
+CUfunction mul3_4096_function;
+CUfunction mul3_3200_function;
+CUfunction mul3_2048_function;
+
 // Stream object and associated data for a stream
 // This name could perhaps be better...
 struct streamData {
   // This CUDA stream; when performing operations, set the current stream to
   // this one
-  cudaStream_t stream;
+  CUstream stream;
 
   // Area of device memory that this stream can use
-  void *gpuMem;
+  CUdeviceptr gpuMem;
   
   // Area of host memory that this stream can use
   // This buffer is pinned memory
-  void *cpuMem;
+  void* cpuMem;
 
   // Total size of buffers at max capacity (set at creation time)
   size_t memCapacity;
@@ -62,12 +82,15 @@ struct streamData {
 
   // Check for CGBN errors after kernel finishes using this
   cgbn_error_report_t *report;
+  // This event is used, along with deviceToHost, to determine the total run
+  // time of this launch, including upload, download, and execution
+  CUevent start;
   // Synchronize this event to wait for host to device transfer before kernel execution
-  cudaEvent_t hostToDevice;
+  CUevent hostToDevice;
   // Synchronize this event to wait for kernel execution to finish before device to host transfer
-  cudaEvent_t exec;
+  CUevent exec;
   // Synchronize this event to wait for downloading to finish before using results
-  cudaEvent_t deviceToHost;
+  CUevent deviceToHost;
 };
 
 // For this example, there are quite a few template parameters that are used to generate the actual code.
@@ -122,6 +145,12 @@ class cmixPrecomp {
     mem_t x;
     mem_t y;
   } mul2_input_t;
+
+  typedef struct {
+    mem_t x;
+    mem_t y;
+    mem_t z;
+  } mul3_input_t;
 
   typedef struct {
     mem_t privateKey; // Used to calculate both outputs 
@@ -309,7 +338,7 @@ class cmixPrecomp {
 // Unfortunately, the kernel must be separate from the cmixPrecomp class
 // kernel_powm_odd<params><<<(instance_count+IPB-1)/IPB, TPB>>>(report, gpuInputs, gpuResults, instance_count);
 template<class params>
-__global__ void kernel_powm_odd(cgbn_error_report_t *report, typename cmixPrecomp<params>::mem_t *constants, typename cmixPrecomp<params>::powm_odd_input_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
+__device__ void kernel_powm_odd(cgbn_error_report_t *report, typename cmixPrecomp<params>::mem_t *constants, typename cmixPrecomp<params>::powm_odd_input_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -338,7 +367,7 @@ __global__ void kernel_powm_odd(cgbn_error_report_t *report, typename cmixPrecom
 }
 
 template<class params>
-__global__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp<params>::elgamal_constant_t *constants, typename cmixPrecomp<params>::elgamal_input_t *inputs, typename cmixPrecomp<params>::elgamal_output_t *outputs, size_t count) {
+__device__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp<params>::elgamal_constant_t *constants, typename cmixPrecomp<params>::elgamal_input_t *inputs, typename cmixPrecomp<params>::elgamal_output_t *outputs, size_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -385,7 +414,7 @@ __global__ void kernel_elgamal(cgbn_error_report_t *report, typename cmixPrecomp
 }
 
 template<class params>
-__global__ void kernel_reveal(cgbn_error_report_t *report, typename cmixPrecomp<params>::reveal_constant_t *constants, typename cmixPrecomp<params>::mem_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
+__device__ void kernel_reveal(cgbn_error_report_t *report, typename cmixPrecomp<params>::reveal_constant_t *constants, typename cmixPrecomp<params>::mem_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -405,48 +434,9 @@ __global__ void kernel_reveal(cgbn_error_report_t *report, typename cmixPrecomp<
   cgbn_store(po._env, &(outputs[instance]), result);
 }
 
-template<class params>
-__global__ void kernel_strip(cgbn_error_report_t *report, typename cmixPrecomp<params>::reveal_constant_t *constants, typename cmixPrecomp<params>::strip_input_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
-  int32_t instance;
-
-  // decode an instance number from the blockIdx and threadIdx
-  instance=(blockIdx.x*blockDim.x + threadIdx.x)/params::TPI;
-  if(instance>=count)
-    return;
-
-  cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
-  typename cmixPrecomp<params>::bn_t  cypher, Z, prime, precomputation, result;
-
-  cgbn_load(po._env, cypher, &(inputs[instance].cypher));
-  cgbn_load(po._env, Z, &(constants->Z));
-  cgbn_load(po._env, prime, &(constants->prime));
-
-  // Strip runs on the last node only and it begins with a reveal operation
-  bool ok = po.root_coprime(result, cypher, Z, prime);
-  
-  if (ok) {
-    cgbn_load(po._env, precomputation, &(inputs[instance].precomputation));
-    // It should be possible to get a speedup here, because the
-    // prime is odd
-    ok = cgbn_modular_inverse(po._env, precomputation, precomputation, prime);
-    if (ok) {
-      // It may be possible to do this multiplication faster
-      // This is just a best guess
-      uint32_t np0 = cgbn_bn2mont(po._env, precomputation, precomputation, prime);
-      cgbn_bn2mont(po._env, cypher, cypher, prime);
-      cgbn_mont_mul(po._env, result, precomputation, cypher, prime, np0);
-      cgbn_mont2bn(po._env, result, result, prime, np0);
-      cgbn_store(po._env, &(outputs[instance]), result);
-    } else {
-      // The second modular inverse failed
-      po._context.report_error(cgbn_inverse_does_not_exist_error);
-    }
-  }
-}
-
 // Multiply x by y mod prime
 template<class params>
-__global__ void kernel_mul2(cgbn_error_report_t *report, typename cmixPrecomp<params>::mem_t *constants, typename cmixPrecomp<params>::mul2_input_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
+__device__ void kernel_mul2(cgbn_error_report_t *report, typename cmixPrecomp<params>::mem_t *constants, typename cmixPrecomp<params>::mul2_input_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
   int32_t instance;
 
   // decode an instance number from the blockIdx and threadIdx
@@ -455,7 +445,7 @@ __global__ void kernel_mul2(cgbn_error_report_t *report, typename cmixPrecomp<pa
     return;
 
   cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
-  typename cmixPrecomp<params>::bn_t  x, y, prime, result;
+  typename cmixPrecomp<params>::bn_t  x, y, prime;
 
   cgbn_load(po._env, x, &(inputs[instance].x));
   cgbn_load(po._env, y, &(inputs[instance].y));
@@ -463,10 +453,39 @@ __global__ void kernel_mul2(cgbn_error_report_t *report, typename cmixPrecomp<pa
 
   uint32_t np0 = cgbn_bn2mont(po._env, x, x, prime);
   cgbn_bn2mont(po._env, y, y, prime);
-  cgbn_mont_mul(po._env, result, x, y, prime, np0);
-  cgbn_mont2bn(po._env, result, result, prime, np0);
+  cgbn_mont_mul(po._env, x, x, y, prime, np0);
+  cgbn_mont2bn(po._env, x, x, prime, np0);
 
-  cgbn_store(po._env, &(outputs[instance]), result);
+  cgbn_store(po._env, &(outputs[instance]), x);
+}
+
+// Multiply x, y, and z mod prime
+template<class params>
+__device__ void kernel_mul3(cgbn_error_report_t *report, typename cmixPrecomp<params>::mem_t *constants, typename cmixPrecomp<params>::mul3_input_t *inputs, typename cmixPrecomp<params>::mem_t *outputs, size_t count) {
+  int32_t instance;
+
+  // decode an instance number from the blockIdx and threadIdx
+  instance=(blockIdx.x*blockDim.x + threadIdx.x)/params::TPI;
+  if(instance>=count)
+    return;
+
+  cmixPrecomp<params>                 po(cgbn_report_monitor, report, instance);
+  typename cmixPrecomp<params>::bn_t  x, y, prime;
+
+  cgbn_load(po._env, x, &(inputs[instance].x));
+  cgbn_load(po._env, y, &(inputs[instance].y));
+  cgbn_load(po._env, prime, constants);
+
+  // Pattern: result stored in first non env param
+  uint32_t np0 = cgbn_bn2mont(po._env, x, x, prime);
+  cgbn_bn2mont(po._env, y, y, prime);
+  cgbn_mont_mul(po._env, x, x, y, prime, np0);
+  cgbn_load(po._env,y , &(inputs[instance].z));
+  cgbn_bn2mont(po._env, y, y, prime);
+  cgbn_mont_mul(po._env, x, x, y, prime, np0);
+  cgbn_mont2bn(po._env, x, x, prime, np0);
+
+  cgbn_store(po._env, &(outputs[instance]), x);
 }
 
 
@@ -474,18 +493,26 @@ __global__ void kernel_mul2(cgbn_error_report_t *report, typename cmixPrecomp<pa
 // Enqueues kernel on the stream and returns immediately (non-blocking)
 // The results will be placed in the stream's gpu outputs buffer some time after the kernel launch
 // Precondition: stream should have had upload called on it
+// We need to invoke kernels using the cuda driver API, which is a little more complicated
 template<class params>
 const char* run(streamData *stream) {
   debugPrint("run (streamData, kernel)");
   const int32_t              TPB=(params::TPB==0) ? 128 : params::TPB;    // default threads per block to 128
   const int32_t              TPI=params::TPI, IPB=TPB/TPI;                // IPB is instances per block
+  unsigned int gridDimX = (stream->length+IPB-1)/IPB;
+  unsigned int blockDimX = TPB;
 
-  CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->hostToDevice, 0));
+  CU_CHECK_RETURN(cuStreamWaitEvent(stream->stream, stream->hostToDevice, 0));
   // launch kernel with blocks=ceil(instance_count/IPB) and threads=TPB
   // TODO We should be able to launch more than just this kernel.
   //  Organize with enumeration? Is it possible to use templates to make this better?
   typedef typename cmixPrecomp<params>::mem_t mem_t;
 
+  CUfunction function;
+  // Report and number of items are always the same for all calls
+  void *kernelParams[5] = { &stream->report, NULL, NULL, NULL, &stream->length };
+
+  // select function and parameters locations
   switch (stream->whichToRun) {
   case KERNEL_POWM_ODD:
     {
@@ -493,8 +520,21 @@ const char* run(streamData *stream) {
       mem_t* gpuConstants = (mem_t*)stream->gpuMem;
       input_t* gpuInputs = (input_t*)(gpuConstants+1);
       mem_t* gpuOutputs = (mem_t*)(gpuInputs+stream->length);
-      kernel_powm_odd<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
-        stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
+      switch (params::BITS) {
+        case 2048:
+          function = powm_2048_function;
+          break;
+        case 3200:
+          function = powm_3200_function;
+          break;
+        case 4096:
+          function = powm_4096_function;
+          break;
+      }
+      kernelParams[1] = &gpuConstants;
+      kernelParams[2] = &gpuInputs;
+      kernelParams[3] = &gpuOutputs;
+      CU_CHECK_RETURN(cuLaunchKernel(function, gridDimX, 1, 1, blockDimX, 1, 1, 0, stream->stream, kernelParams, NULL));
     }
     break;
   case KERNEL_ELGAMAL:
@@ -505,8 +545,21 @@ const char* run(streamData *stream) {
       constant_t* gpuConstants = (constant_t*)stream->gpuMem;
       input_t* gpuInputs = (input_t*)(gpuConstants+1);
       output_t* gpuOutputs = (output_t*)(gpuInputs+stream->length);
-      kernel_elgamal<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
-        stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
+      switch (params::BITS) {
+        case 2048:
+          function = elgamal_2048_function;
+          break;
+        case 3200:
+          function = elgamal_3200_function;
+          break;
+        case 4096:
+          function = elgamal_4096_function;
+          break;
+      }
+      kernelParams[1] = &gpuConstants;
+      kernelParams[2] = &gpuInputs;
+      kernelParams[3] = &gpuOutputs;
+      CU_CHECK_RETURN(cuLaunchKernel(function, gridDimX, 1, 1, blockDimX, 1, 1, 0, stream->stream, kernelParams, NULL));
     }
     break;
   case KERNEL_REVEAL:
@@ -515,19 +568,21 @@ const char* run(streamData *stream) {
       constant_t* gpuConstants = (constant_t*)stream->gpuMem;
       mem_t* gpuInputs = (mem_t*)(gpuConstants+1);
       mem_t* gpuOutputs = (mem_t*)(gpuInputs+stream->length);
-      kernel_reveal<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
-          stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
-    }
-    break;
-  case KERNEL_STRIP:
-    {
-      typedef typename cmixPrecomp<params>::reveal_constant_t constant_t;
-      typedef typename cmixPrecomp<params>::strip_input_t input_t;
-      constant_t* gpuConstants = (constant_t*)stream->gpuMem;
-      input_t* gpuInputs = (input_t*)(gpuConstants+1);
-      mem_t* gpuOutputs = (mem_t*)(gpuInputs+stream->length);
-      kernel_strip<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
-          stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
+      switch (params::BITS) {
+        case 2048:
+          function = reveal_2048_function;
+          break;
+        case 3200:
+          function = reveal_3200_function;
+          break;
+        case 4096:
+          function = reveal_4096_function;
+          break;
+      }
+      kernelParams[1] = &gpuConstants;
+      kernelParams[2] = &gpuInputs;
+      kernelParams[3] = &gpuOutputs;
+      CU_CHECK_RETURN(cuLaunchKernel(function, gridDimX, 1, 1, blockDimX, 1, 1, 0, stream->stream, kernelParams, NULL));
     }
     break;
   case KERNEL_MUL2:
@@ -536,8 +591,44 @@ const char* run(streamData *stream) {
       mem_t *gpuConstants = (mem_t*)(stream->gpuMem);
       input_t *gpuInputs = (input_t*)(gpuConstants+1);
       mem_t *gpuOutputs = (mem_t*)(gpuInputs+stream->length);
-      kernel_mul2<params><<<(stream->length+IPB-1)/IPB, TPB, 0, stream->stream>>>(
-          stream->report, gpuConstants, gpuInputs, gpuOutputs, stream->length);
+      switch (params::BITS) {
+        case 2048:
+          function = mul2_2048_function;
+          break;
+        case 3200:
+          function = mul2_3200_function;
+          break;
+        case 4096:
+          function = mul2_4096_function;
+          break;
+      }
+      kernelParams[1] = &gpuConstants;
+      kernelParams[2] = &gpuInputs;
+      kernelParams[3] = &gpuOutputs;
+      CU_CHECK_RETURN(cuLaunchKernel(function, gridDimX, 1, 1, blockDimX, 1, 1, 0, stream->stream, kernelParams, NULL));
+    }
+    break;
+  case KERNEL_MUL3:
+    {
+      typedef typename cmixPrecomp<params>::mul3_input_t input_t;
+      mem_t *gpuConstants = (mem_t*)(stream->gpuMem);
+      input_t *gpuInputs = (input_t*)(gpuConstants+1);
+      mem_t *gpuOutputs = (mem_t*)(gpuInputs+stream->length);
+      switch (params::BITS) {
+        case 2048:
+          function = mul3_2048_function;
+          break;
+        case 3200:
+          function = mul3_3200_function;
+          break;
+        case 4096:
+          function = mul3_4096_function;
+          break;
+      }
+      kernelParams[1] = &gpuConstants;
+      kernelParams[2] = &gpuInputs;
+      kernelParams[3] = &gpuOutputs;
+      CU_CHECK_RETURN(cuLaunchKernel(function, gridDimX, 1, 1, blockDimX, 1, 1, 0, stream->stream, kernelParams, NULL));
     }
     break;
   default:
@@ -545,7 +636,7 @@ const char* run(streamData *stream) {
     break;
   }
 
-  CUDA_CHECK_RETURN(cudaEventRecord(stream->exec, stream->stream));
+  CU_CHECK_RETURN(cuEventRecord(stream->exec, stream->stream));
 
   return NULL;
 }
@@ -553,8 +644,9 @@ const char* run(streamData *stream) {
 const char* getResults(streamData *stream) {
   debugPrint("getResults (streamData)");
   // Wait for download to complete
-  CUDA_CHECK_RETURN(cudaEventSynchronize(stream->deviceToHost));
+  CU_CHECK_RETURN(cuEventSynchronize(stream->deviceToHost));
   // Not sure if we can check the error report before this (e.g. in download function)
+  // Could CGBN errors potentially not get returned if stream->deviceToHost doesn't get recorded for some reason?
   CGBN_CHECK_RETURN(stream->report);
   return NULL;
 }
@@ -574,6 +666,19 @@ void* getOutputs(void* mem, size_t numItems) {
   return (void*) (inputs+numItems);
 }
 
+template <class Input, class Constant>
+CUdeviceptr getOutputs(CUdeviceptr mem, size_t numItems) {
+  debugPrint("getOutputs (CUdeviceptr, size_t)");
+  // We want to get the location after the inputs and constants
+  // Order doesn't matter and we assume padding doesn't exist
+  // (which should be true if the big numbers are big enough)
+  // Does this cast work OK?
+  Constant* constants = (Constant*)mem;
+  // Not sure if this is undefined behaviour? Do I have to reinterpret_cast or cast to void to make this work?
+  Input* inputs = (Input*)(constants+1);
+  return (CUdeviceptr) (inputs+numItems);
+}
+
 // Get the memory address of the beginning of the inputs in a buffer
 // Inputs always come right after constants
 template <class Constant>
@@ -588,28 +693,6 @@ typedef powm_params_t<32, 4096, 5> params4096;
 typedef powm_params_t<32, 3200, 5> params3200;
 typedef powm_params_t<32, 2048, 5> params2048;
 
-// create a bunch of streams and buffers suitable for running a particular kernel
-inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
-  debugPrint("createStream (streamData)");
-  stream->memCapacity = createInfo.capacity;
-  stream->length = 0;
-  stream->outputsLength = 0;
-  stream->inputsLength = 0;
-  CUDA_CHECK_RETURN(cudaStreamCreate(&(stream->stream)));
-  CUDA_CHECK_RETURN(cudaMalloc(&(stream->gpuMem), createInfo.capacity));
-  CUDA_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
-  CUDA_CHECK_RETURN(cudaHostAlloc(&(stream->cpuMem), createInfo.capacity, cudaHostAllocDefault));
-
-  // These events are created with timing disabled because it takes time 
-  // to get the timing data, and we don't need it.
-  // cudaEventBlockingSync also prevents 100% cpu usage when synchronizing on an event
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->hostToDevice), cudaEventDisableTiming|cudaEventBlockingSync));
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->exec), cudaEventDisableTiming|cudaEventBlockingSync));
-  CUDA_CHECK_RETURN(cudaEventCreateWithFlags(&(stream->deviceToHost), cudaEventDisableTiming|cudaEventBlockingSync));
-
-  return NULL;
-}
-
 // TODO? Deprecate this and use sizeof / pointer arithmetic instead
 //  Although, I think we might need this for slicing things on the go side
 // TODO? Support different bit lengths
@@ -621,10 +704,10 @@ size_t getConstantsSize(enum kernel op) {
       break;
     case KERNEL_POWM_ODD:
     case KERNEL_MUL2:
+    case KERNEL_MUL3:
       return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
       break;
     case KERNEL_REVEAL:
-    case KERNEL_STRIP:
       return sizeof(typename cmixPrecomp<cgbnParams>::reveal_constant_t);
       break;
     default:
@@ -646,11 +729,11 @@ size_t getInputSize(enum kernel op) {
     case KERNEL_REVEAL:
       return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
       break;
-    case KERNEL_STRIP:
-      return sizeof(typename cmixPrecomp<cgbnParams>::strip_input_t);
-      break;
     case KERNEL_MUL2:
       return sizeof(typename cmixPrecomp<cgbnParams>::mul2_input_t);
+      break;
+    case KERNEL_MUL3:
+      return sizeof(typename cmixPrecomp<cgbnParams>::mul3_input_t);
       break;
     default:
       // Unimplemented
@@ -667,8 +750,8 @@ size_t getOutputSize(enum kernel op) {
       break;
     case KERNEL_POWM_ODD:
     case KERNEL_REVEAL:
-    case KERNEL_STRIP:
     case KERNEL_MUL2:
+    case KERNEL_MUL3:
       // Most ops just return one number
       return sizeof(typename cmixPrecomp<cgbnParams>::mem_t);
       break;
@@ -685,7 +768,7 @@ template<class cgbnParams>
 const char* upload(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
   auto gpuData = (streamData*)stream;
   // Previous download must finish before data are uploaded
-  CUDA_CHECK_RETURN(cudaStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
+  CU_CHECK_RETURN(cuStreamWaitEvent(gpuData->stream, gpuData->deviceToHost, 0));
   
   // Set instance count; it's re-used when the kernel gets run later
   gpuData->length = instance_count;
@@ -703,13 +786,15 @@ const char* upload(const uint32_t instance_count, void *stream, enum kernel whic
   gpuData->outputsLength = outputsDownloadSize;
   gpuData->whichToRun = whichToRun;
 
+  // Record starting time of this upload
+  CU_CHECK_RETURN(cuEventRecord(gpuData->start, gpuData->stream));
+
   // Upload the inputs
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(gpuData->gpuMem, gpuData->cpuMem, gpuData->inputsLength,
-        cudaMemcpyHostToDevice, gpuData->stream));
+  CU_CHECK_RETURN(cuMemcpyHtoDAsync(gpuData->gpuMem, gpuData->cpuMem, gpuData->inputsLength, gpuData->stream));
 
   // Run should wait on this event for kernel launch
   // The event should include any memcpys that haven't completed yet
-  CUDA_CHECK_RETURN(cudaEventRecord(gpuData->hostToDevice, gpuData->stream));
+  CU_CHECK_RETURN(cuEventRecord(gpuData->hostToDevice, gpuData->stream));
 
   return NULL;
 }
@@ -725,7 +810,7 @@ template<class cgbnParams>
 const char* download(void *s) {
   auto stream = (streamData*)s;
   // Wait for the kernel to finish running
-  CUDA_CHECK_RETURN(cudaStreamWaitEvent(stream->stream, stream->exec, 0));
+  CU_CHECK_RETURN(cuStreamWaitEvent(stream->stream, stream->exec, 0));
 
   // The kernel ran successfully, so we get the results off the GPU
   // Outputs come right after the inputs
@@ -738,7 +823,8 @@ const char* download(void *s) {
   // For now, just instantiate with types for elgamal 4k?
   // This is a mess. We should just be able to pass "elgamal" or, at worst, "elgamal<params4096>" 
   // I'd rather not have to switch all the types and instantiate different classes based on the cryptop but that's a limitation on Cgo.
-  void *cpuOutputs, *gpuOutputs;
+  void *cpuOutputs;
+  CUdeviceptr gpuOutputs;
   typedef typename cmixPrecomp<cgbnParams>::mem_t mem_t;
   switch (stream->whichToRun) {
   case KERNEL_ELGAMAL:
@@ -753,25 +839,24 @@ const char* download(void *s) {
     cpuOutputs = getOutputs<mem_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(stream->cpuMem, stream->length);
     gpuOutputs = getOutputs<mem_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(stream->gpuMem, stream->length);
     break;
-  case KERNEL_STRIP:
-    cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::strip_input_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(stream->cpuMem, stream->length);
-    gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::strip_input_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(stream->gpuMem, stream->length);
-    break;
   case KERNEL_MUL2:
     cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, mem_t>(stream->cpuMem, stream->length);
     gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, mem_t>(stream->gpuMem, stream->length);
     break;
+  case KERNEL_MUL3:
+    cpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul3_input_t, mem_t>(stream->cpuMem, stream->length);
+    gpuOutputs = getOutputs<typename cmixPrecomp<cgbnParams>::mul3_input_t, mem_t>(stream->gpuMem, stream->length);
+    break;
   default:
     return strdup("Unknown kernel for download; unable to find location of outputs in buffer\n");
   }
-  CUDA_CHECK_RETURN(cudaMemcpyAsync(cpuOutputs, gpuOutputs, stream->outputsLength, cudaMemcpyDeviceToHost, stream->stream));
-  CUDA_CHECK_RETURN(cudaEventRecord(stream->deviceToHost, stream->stream));
+  CU_CHECK_RETURN(cuMemcpyDtoHAsync(cpuOutputs, gpuOutputs, stream->outputsLength, stream->stream));
+  CU_CHECK_RETURN(cuEventRecord(stream->deviceToHost, stream->stream));
 
   return NULL;
 }
 
 // Return cpu inputs buffer pointer for writing
-// TODO Implement depending on kernel/length
 template<class cgbnParams>
 void* getCpuInputs(void* stream, enum kernel op) {
   streamData* s = (streamData*)stream;
@@ -781,12 +866,10 @@ void* getCpuInputs(void* stream, enum kernel op) {
       break;
     case KERNEL_POWM_ODD:
     case KERNEL_MUL2:
+    case KERNEL_MUL3:
       return getInputs<typename cmixPrecomp<cgbnParams>::mem_t>(s->cpuMem);
       break;
     case KERNEL_REVEAL:
-      return getInputs<typename cmixPrecomp<cgbnParams>::reveal_constant_t>(s->cpuMem);
-      break;
-    case KERNEL_STRIP:
       return getInputs<typename cmixPrecomp<cgbnParams>::reveal_constant_t>(s->cpuMem);
       break;
     default:
@@ -813,18 +896,43 @@ void* getCpuOutputs(void* stream) {
       return getOutputs<typename cmixPrecomp<cgbnParams>::mem_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(
           s->cpuMem, s->length);
       break;
-    case KERNEL_STRIP:
-      return getOutputs<typename cmixPrecomp<cgbnParams>::strip_input_t, typename cmixPrecomp<cgbnParams>::reveal_constant_t>(
-          s->cpuMem, s->length);
-      break;
     case KERNEL_MUL2:
       return getOutputs<typename cmixPrecomp<cgbnParams>::mul2_input_t, typename cmixPrecomp<cgbnParams>::mem_t>(
           s->cpuMem, s->length);
+      break;
+    case KERNEL_MUL3:
+      return getOutputs<typename cmixPrecomp<cgbnParams>::mul3_input_t, typename cmixPrecomp<cgbnParams>::mem_t>(
+          s->cpuMem, s->length);
+      break;
     default:
       // Unimplemented
       return NULL;
       break;
   }
+}
+
+// create a bunch of streams and buffers suitable for running a particular kernel
+inline const char* createStream(streamCreateInfo createInfo, streamData* stream) {
+  CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
+  debugPrint("createStream (streamData)");
+  stream->memCapacity = createInfo.capacity;
+  stream->length = 0;
+  stream->outputsLength = 0;
+  stream->inputsLength = 0;
+  CU_CHECK_RETURN(cuStreamCreate(&(stream->stream), CU_STREAM_DEFAULT));
+  CU_CHECK_RETURN(cuMemAlloc(&(stream->gpuMem), createInfo.capacity));
+  CU_CHECK_RETURN(cgbn_error_report_alloc(&stream->report));
+  CU_CHECK_RETURN(cuMemAllocHost(&(stream->cpuMem), createInfo.capacity));
+
+  // cudaEventBlockingSync prevents 100% cpu usage when synchronizing on an event
+  // However, it may impact performance, so I turned it off for now(?)
+  CU_CHECK_RETURN(cuEventCreate(&stream->start, CU_EVENT_DISABLE_TIMING));
+  CU_CHECK_RETURN(cuEventCreate(&stream->hostToDevice, CU_EVENT_DISABLE_TIMING));
+  CU_CHECK_RETURN(cuEventCreate(&stream->exec, CU_EVENT_DISABLE_TIMING));
+  CU_CHECK_RETURN(cuEventCreate(&stream->deviceToHost, CU_EVENT_DISABLE_TIMING));
+  CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
+
+  return NULL;
 }
 
 
@@ -882,57 +990,59 @@ extern "C" {
     return getCpuInputs<params2048>(stream, op);
   }
 
-  // Enqueue download after kernel run
-  const char* download4096(void *s) {
-    debugPrint("download (void)");
-    return download<params4096>(s);
-  }
-  // Enqueue download after kernel run
-  const char* download3200(void *s) {
-    debugPrint("download (void)");
-    return download<params3200>(s);
-  }
-  // Enqueue download after kernel run
-  const char* download2048(void *s) {
-    debugPrint("download (void)");
-    return download<params2048>(s);
-  }
-
-  // Trigger run for 4096 bits
-  const char* run4096(void* stream) {
-    debugPrint("run4096 (void)");
-    return run<params4096>(stream);
-  }
-  // Trigger run for 3200 bits
-  const char* run3200(void* stream) {
-    debugPrint("run3200 (void)");
-    return run<params3200>(stream);
-  }
-  // Trigger run for 2048 bits
-  const char* run2048(void* stream) {
-    debugPrint("run2048 (void)");
-    return run<params2048>(stream);
+  // Enqueue the specified kernel at 4k bits size
+  const char* enqueue4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
+    debugPrint("enqueue4096 (void)");
+    const char* err;
+    err = upload<params4096>(instance_count, stream, whichToRun);
+    if (err != NULL) {
+      return err;
+    }
+    // memset output buffer to make it possible to monitor for results
+    err = run<params4096>(stream);
+    if (err != NULL) {
+      return err;
+    }
+    CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
+    return download<params4096>(stream);
   }
 
-  // Run upload for the specified kernel and 4k bits size
-  const char* upload4096(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-    debugPrint("upload4096 (void)");
-    return upload<params4096>(instance_count, stream, whichToRun);
+  // Enqueue the specified kernel at 3k bits size
+  const char* enqueue3200(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
+    debugPrint("enqueue3200 (void)");
+    const char* err;
+    err = upload<params3200>(instance_count, stream, whichToRun);
+    if (err != NULL) {
+      return err;
+    }
+    err = run<params3200>(stream);
+    if (err != NULL) {
+      return err;
+    }
+    CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
+    return download<params3200>(stream);
   }
 
-  // Run upload for the specified kernel and 3k bits size
-  const char* upload3200(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-    debugPrint("upload3200 (void)");
-    return upload<params3200>(instance_count, stream, whichToRun);
+  // Enqueue the specified kernel at 2k bits size
+  const char* enqueue2048(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
+    CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
+    debugPrint("enqueue2048 (void)");
+    const char* err;
+    err = upload<params2048>(instance_count, stream, whichToRun);
+    if (err != NULL) {
+      return err;
+    }
+    err = run<params2048>(stream);
+    if (err != NULL) {
+      return err;
+    }
+    CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
+    return download<params2048>(stream);
   }
 
-  // Run upload for the specified kernel and 2k bits size
-  const char* upload2048(const uint32_t instance_count, void *stream, enum kernel whichToRun) {
-    debugPrint("upload2048 (void)");
-    return upload<params2048>(instance_count, stream, whichToRun);
-  }
-  
-
+  // Returns error and elapsed time of the run in floating-point seconds
   const char* getResults(void *stream) {
     debugPrint("getResults (void)");
     return getResults((streamData*)stream);
@@ -940,12 +1050,23 @@ extern "C" {
 
   // Call this when starting the program to allocate resources
   // Returns stream or error
-  struct return_data* createStream(streamCreateInfo createInfo) {
+  struct stream_return_data* createStream(streamCreateInfo createInfo) {
     debugPrint("createStream (streamCreateInfo)");
-    return_data* result = (return_data*)malloc(sizeof(*result));
+    stream_return_data* result = (stream_return_data*)malloc(sizeof(*result));
+    if (result == NULL) {
+      // Allocation failed, rest of method's not valid
+      return NULL;
+    }
     streamData *s = (streamData*)(malloc(sizeof(*s)));
+    if (s == NULL) {
+      // Allocation failed, rest of method's not valid
+      // Don't return error string as its allocation is likely to also fail
+      free((void*)result);
+      return NULL;
+    }
     result->error = createStream(createInfo, s);
     result->result = s;
+    result->cpuBuf = s->cpuMem;
     return result;
   }
 
@@ -956,42 +1077,182 @@ extern "C" {
     auto stream = (streamData*)destroyee;
     // Don't know at what point there could have been errors while creating this stream,
     // so make sure things exist before destroying them
+    CU_CHECK_RETURN(cuCtxPushCurrent(cuContext));
     if (stream != NULL) {
-      if (stream->gpuMem != NULL) {
-        CUDA_CHECK_RETURN(cudaFree(stream->gpuMem));
+      if (stream->gpuMem != 0) {
+        CU_CHECK_RETURN(cuMemFree(stream->gpuMem));
+        // Setting to null prevents double free if destroyStream is called twice for some reason
+        // This shouldn't happen
+        stream->gpuMem = 0;
       }
       if (stream->cpuMem != NULL) {
-        CUDA_CHECK_RETURN(cudaFreeHost(stream->cpuMem));
+        CU_CHECK_RETURN(cuMemFreeHost(stream->cpuMem));
+        stream->cpuMem = NULL;
       }
       if (stream->report != NULL) {
-        CUDA_CHECK_RETURN(cgbn_error_report_free(stream->report));
+        CU_CHECK_RETURN(cgbn_error_report_free(stream->report));
+        stream->report = NULL;
+      }
+      if (stream->start != NULL) {
+        CU_CHECK_RETURN(cuEventDestroy(stream->start));
+        stream->start = NULL;
       }
       if (stream->hostToDevice != NULL) {
-        CUDA_CHECK_RETURN(cudaEventDestroy(stream->hostToDevice));
+        CU_CHECK_RETURN(cuEventDestroy(stream->hostToDevice));
+        stream->hostToDevice = NULL;
       }
       if (stream->exec != NULL) {
-        CUDA_CHECK_RETURN(cudaEventDestroy(stream->exec));
+        CU_CHECK_RETURN(cuEventDestroy(stream->exec));
+        stream->exec = NULL;
       }
       if (stream->deviceToHost != NULL) {
-        CUDA_CHECK_RETURN(cudaEventDestroy(stream->deviceToHost));
+        CU_CHECK_RETURN(cuEventDestroy(stream->deviceToHost));
+        stream->deviceToHost = NULL;
       }
       free((void*)stream);
     }
+    CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
 
     return NULL;
   }
 
-  // Call this after execution has completed to write out profile information to the disk
-  const char* resetDevice() {
-    CUDA_CHECK_RETURN(cudaDeviceReset());
-    return NULL;
+#define FALSE 0
+#define TRUE 1
+  // Return true if passed stream has all fields that should be populated after
+  // initialization populated
+  int isStreamValid(void* stream) {
+    if (stream == NULL) {
+      return FALSE;
+    }
+    auto s = (streamData*)stream;
+    if (s->stream == NULL) {
+      return FALSE;
+    }
+    if (s->gpuMem == 0) {
+      return FALSE;
+    }
+    if (s->cpuMem == NULL) {
+      return FALSE;
+    }
+    if (s->report == NULL) {
+      return FALSE;
+    }
+    if (s->start == NULL) {
+      return FALSE;
+    }
+    if (s->hostToDevice == NULL) {
+      return FALSE;
+    }
+    if (s->exec == NULL) {
+      return FALSE;
+    }
+    if (s->deviceToHost == NULL) {
+      return FALSE;
+    }
+    if (s->memCapacity == 0) {
+      return FALSE;
+    }
+    return TRUE;
   }
-
 
   // Return cpu constants buffer pointer for writing
   void* getCpuConstants(void* stream) {
     return ((streamData*)stream)->cpuMem;
   }
 
+  // Eventually: one context per device?
+  // You must call this before any other calls that call cuda
+  const char* initCuda() {
+    if (cuContext == NULL) {
+      CU_CHECK_RETURN(cuInit(0));
+      // count available devices
+      int deviceCount = 0;
+      CU_CHECK_RETURN(cuDeviceGetCount(&deviceCount));
+      
+      if (deviceCount == 0) {
+        return strdup("no CUDA devices available. are drivers installed? try running node with useGPU:false");
+      }
+
+      // try first device, which should work if we made it here
+      // TODO implement explicit device selection
+      int dev = 0;
+      int cuDevice = 0;
+      CU_CHECK_RETURN(cuDeviceGet(&cuDevice, dev));
+
+      // initialize context on the device we chose
+      CU_CHECK_RETURN(cuCtxCreate(&cuContext, 0, cuDevice));
+      // Samples have a global cuContext, so that's probably fine for now...
+      CU_CHECK_RETURN(cuModuleLoad(&cuModule, "/opt/xxnetwork/lib/libpow.fatbin"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul2_4096_function, cuModule, "mul2_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul3_4096_function, cuModule, "mul3_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&elgamal_4096_function, cuModule, "elgamal_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&reveal_4096_function, cuModule, "reveal_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&powm_4096_function, cuModule, "powm_4096"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul2_3200_function, cuModule, "mul2_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul3_3200_function, cuModule, "mul3_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&elgamal_3200_function, cuModule, "elgamal_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&reveal_3200_function, cuModule, "reveal_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&powm_3200_function, cuModule, "powm_3200"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul2_2048_function, cuModule, "mul2_2048"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&mul3_2048_function, cuModule, "mul3_2048"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&elgamal_2048_function, cuModule, "elgamal_2048"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&reveal_2048_function, cuModule, "reveal_2048"));
+      CU_CHECK_RETURN(cuModuleGetFunction(&powm_2048_function, cuModule, "powm_2048"));
+      return NULL;
+    }
+    return NULL;
+  }
+
+
+}
+
+// Kernel wrappers with "C"
+// These are needed to be able to load kernels without having to copy mangled names from cuobjdump
+extern "C" {
+  __global__ void mul2_4096(cgbn_error_report_t *report, typename cmixPrecomp<params4096>::mem_t *constants, typename cmixPrecomp<params4096>::mul2_input_t *inputs, typename cmixPrecomp<params4096>::mem_t *outputs, size_t count) {
+    kernel_mul2<params4096>(report, constants, inputs, outputs, count);
+  }
+  __global__ void mul2_3200(cgbn_error_report_t *report, typename cmixPrecomp<params3200>::mem_t *constants, typename cmixPrecomp<params3200>::mul2_input_t *inputs, typename cmixPrecomp<params3200>::mem_t *outputs, size_t count) {
+    kernel_mul2<params3200>(report, constants, inputs, outputs, count);
+  }
+  __global__ void mul2_2048(cgbn_error_report_t *report, typename cmixPrecomp<params2048>::mem_t *constants, typename cmixPrecomp<params2048>::mul2_input_t *inputs, typename cmixPrecomp<params2048>::mem_t *outputs, size_t count) {
+    kernel_mul2<params2048>(report, constants, inputs, outputs, count);
+  }
+__global__ void mul3_4096(cgbn_error_report_t *report, typename cmixPrecomp<params4096>::mem_t *constants, typename cmixPrecomp<params4096>::mul3_input_t *inputs, typename cmixPrecomp<params4096>::mem_t *outputs, size_t count) {
+    kernel_mul3<params4096>(report, constants, inputs, outputs, count);
+  }
+__global__ void mul3_3200(cgbn_error_report_t *report, typename cmixPrecomp<params3200>::mem_t *constants, typename cmixPrecomp<params3200>::mul3_input_t *inputs, typename cmixPrecomp<params3200>::mem_t *outputs, size_t count) {
+    kernel_mul3<params3200>(report, constants, inputs, outputs, count);
+  }
+__global__ void mul3_2048(cgbn_error_report_t *report, typename cmixPrecomp<params2048>::mem_t *constants, typename cmixPrecomp<params2048>::mul3_input_t *inputs, typename cmixPrecomp<params2048>::mem_t *outputs, size_t count) {
+    kernel_mul3<params2048>(report, constants, inputs, outputs, count);
+  }
+  __global__ void powm_4096(cgbn_error_report_t *report, typename cmixPrecomp<params4096>::mem_t *constants, typename cmixPrecomp<params4096>::powm_odd_input_t *inputs, typename cmixPrecomp<params4096>::mem_t *outputs, size_t count) {
+    kernel_powm_odd<params4096>(report, constants, inputs, outputs, count);
+  }
+  __global__ void powm_3200(cgbn_error_report_t *report, typename cmixPrecomp<params3200>::mem_t *constants, typename cmixPrecomp<params3200>::powm_odd_input_t *inputs, typename cmixPrecomp<params3200>::mem_t *outputs, size_t count) {
+    kernel_powm_odd<params3200>(report, constants, inputs, outputs, count);
+  }
+  __global__ void powm_2048(cgbn_error_report_t *report, typename cmixPrecomp<params2048>::mem_t *constants, typename cmixPrecomp<params2048>::powm_odd_input_t *inputs, typename cmixPrecomp<params2048>::mem_t *outputs, size_t count) {
+    kernel_powm_odd<params2048>(report, constants, inputs, outputs, count);
+  }
+  __global__ void elgamal_4096(cgbn_error_report_t *report, typename cmixPrecomp<params4096>::elgamal_constant_t *constants, typename cmixPrecomp<params4096>::elgamal_input_t *inputs, typename cmixPrecomp<params4096>::elgamal_output_t *outputs, size_t count) {
+    kernel_elgamal<params4096>(report, constants, inputs, outputs, count);
+  }
+  __global__ void elgamal_3200(cgbn_error_report_t *report, typename cmixPrecomp<params3200>::elgamal_constant_t *constants, typename cmixPrecomp<params3200>::elgamal_input_t *inputs, typename cmixPrecomp<params3200>::elgamal_output_t *outputs, size_t count) {
+    kernel_elgamal<params3200>(report, constants, inputs, outputs, count);
+  }
+  __global__ void elgamal_2048(cgbn_error_report_t *report, typename cmixPrecomp<params2048>::elgamal_constant_t *constants, typename cmixPrecomp<params2048>::elgamal_input_t *inputs, typename cmixPrecomp<params2048>::elgamal_output_t *outputs, size_t count) {
+    kernel_elgamal<params2048>(report, constants, inputs, outputs, count);
+  }
+  __global__ void reveal_4096(cgbn_error_report_t *report, typename cmixPrecomp<params4096>::reveal_constant_t *constants, typename cmixPrecomp<params4096>::mem_t *inputs, typename cmixPrecomp<params4096>::mem_t *outputs, size_t count) {
+    kernel_reveal<params4096>(report, constants, inputs, outputs, count);
+  }
+  __global__ void reveal_3200(cgbn_error_report_t *report, typename cmixPrecomp<params3200>::reveal_constant_t *constants, typename cmixPrecomp<params3200>::mem_t *inputs, typename cmixPrecomp<params3200>::mem_t *outputs, size_t count) {
+    kernel_reveal<params3200>(report, constants, inputs, outputs, count);
+  }
+  __global__ void reveal_2048(cgbn_error_report_t *report, typename cmixPrecomp<params2048>::reveal_constant_t *constants, typename cmixPrecomp<params2048>::mem_t *inputs, typename cmixPrecomp<params2048>::mem_t *outputs, size_t count) {
+    kernel_reveal<params2048>(report, constants, inputs, outputs, count);
+  }
 }
 
