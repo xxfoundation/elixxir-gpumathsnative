@@ -1109,6 +1109,10 @@ extern "C" {
         CU_CHECK_RETURN(cuEventDestroy(stream->deviceToHost));
         stream->deviceToHost = NULL;
       }
+      if (stream->stream != NULL) {
+        CU_CHECK_RETURN(cuStreamDestroy(stream->stream));
+        stream->stream = NULL;
+      }
       free((void*)stream);
     }
     CU_CHECK_RETURN(cuCtxPopCurrent(&cuContext));
