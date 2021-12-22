@@ -1,15 +1,8 @@
-# From: https://about.gitlab.com/2017/09/21/how-to-create-ci-cd-pipeline-with-autodeploy-to-kubernetes-using-gitlab-and-helm/
-
 cache:
   untracked: true
   key: "$CI_BUILD_REF_NAME"
   paths:
     - vendor/
-
-variables:
-  REPO_DIR: gitlab.com/elixxir
-  REPO_NAME: gpumathsnative
-  DOCKER_IMAGE: elixxirlabs/cuda-go:latest
 
 before_script:
   - echo $CI_BUILD_REF
